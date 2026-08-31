@@ -1,4 +1,4 @@
-const WEBHOOK_URL = "https://dtsolutions.app.n8n.cloud/webhook/chat";
+const WEBHOOK_URL = "https://dtsolutions.app.n8n.cloud/webhook/683536ba-dc5c-4796-89e0-b497f8fa92a4";
   const STATUS_URL = "https://dtsolutions.app.n8n.cloud/webhook/pipeline-status";
   const STORAGE_KEY = 'ba_agent_chats';
   const PIPELINE_STAGES = ['process_design', 'process_map', 'decision_tree', 'business_rules', 'automation_design', 'complete'];
