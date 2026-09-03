@@ -1,408 +1,257 @@
 const WEBHOOK_URL = "https://dtsolutions.app.n8n.cloud/webhook/683536ba-dc5c-4796-89e0-b497f8fa92a4";
 const STORAGE_KEY = 'as_is_discovery_sessions';
+const MAX_FILE_SIZE = 8 * 1024 * 1024;
 
 let sessionId = generateSessionId();
 let isLoading = false;
-let currentMessages = [];        // in-memory message log for active session
-let attachedFiles = [];          // staged files: { name, type, size, data }
-let receivedDepartments = [];    // folder names the backend has stored, e.g. "01 - Legal"
-let departments = [];            // [{name, folderName, received}] from the backend
+let currentMessages = [];
+let attachedFiles = [];
+let receivedDepartments = [];
+let departments = [];           // [{name, folderName, received, assessed, automation, awaitingAnswers}]
 let companyName = '';
+let runningDept = null;         // department key currently being assessed (UI only)
+let prevState = {};             // folderName -> state, to animate changes
 
-const MAX_FILE_SIZE = 8 * 1024 * 1024; // 8MB per file
+const $ = id => document.getElementById(id);
+const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // ── Init ──
-updateSessionLabel();
+renderEmpty();
 renderSidebar();
+renderBoard();
+updateSessionLabel();
+setupDragDrop();
 
-// ── LocalStorage helpers ──
-function loadAllChats() {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; }
-  catch { return {}; }
-}
-function saveChat(id, data) {
-  const all = loadAllChats();
-  all[id] = data;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
-}
-function deleteChat(id) {
-  const all = loadAllChats();
-  delete all[id];
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
-}
+// ── Storage ──
+function loadAllChats() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch { return {}; } }
+function saveChat(id, data) { const all = loadAllChats(); all[id] = data; localStorage.setItem(STORAGE_KEY, JSON.stringify(all)); }
+function deleteChat(id) { const all = loadAllChats(); delete all[id]; localStorage.setItem(STORAGE_KEY, JSON.stringify(all)); }
 function saveCurrentConversation() {
-  if (currentMessages.length === 0) return;
-  const all = loadAllChats();
-  const existing = all[sessionId] || {};
-  saveChat(sessionId, {
-    sessionId,
-    title: existing.title || deriveTitleFromMessages(),
-    messages: currentMessages,
-    received: receivedDepartments,
-    departments,
-    companyName,
-    updatedAt: Date.now()
-  });
+  if (!currentMessages.length) return;
+  const existing = loadAllChats()[sessionId] || {};
+  saveChat(sessionId, { sessionId, title: companyName || existing.title || deriveTitle(), messages: currentMessages,
+    received: receivedDepartments, departments, companyName, updatedAt: Date.now() });
   renderSidebar();
 }
-function deriveTitleFromMessages() {
+function deriveTitle() {
   const first = currentMessages.find(m => m.role === 'user');
   if (!first) return 'Untitled session';
-  return first.text.length > 45 ? first.text.slice(0, 45) + '…' : first.text;
+  return first.text.length > 40 ? first.text.slice(0, 40) + '…' : first.text;
 }
 
-// ── Sidebar rendering ──
+// ── Sidebar ──
 function renderSidebar() {
-  const all = loadAllChats();
-  const list = document.getElementById('sidebar-list');
-  const entries = Object.values(all).sort((a, b) => b.updatedAt - a.updatedAt);
-
-  if (entries.length === 0) {
-    list.innerHTML = '<div class="sidebar-empty">No previous sessions yet.<br>Start collecting documents to see them here.</div>';
-    return;
-  }
-  const now = Date.now();
-  const oneDayMs = 86400000;
-  const today = entries.filter(e => now - e.updatedAt < oneDayMs);
-  const earlier = entries.filter(e => now - e.updatedAt >= oneDayMs);
-
-  let html = '';
-  if (today.length) {
-    html += '<div class="sidebar-section-label">Today</div>';
-    today.forEach(e => html += chatItemHTML(e));
-  }
-  if (earlier.length) {
-    html += '<div class="sidebar-section-label">Earlier</div>';
-    earlier.forEach(e => html += chatItemHTML(e));
-  }
-  list.innerHTML = html;
+  const list = $('sidebar-list');
+  const entries = Object.values(loadAllChats()).sort((a, b) => b.updatedAt - a.updatedAt);
+  if (!entries.length) { list.innerHTML = '<div class="session-empty">Sessions you start will be listed here so you can come back to a company later.</div>'; return; }
+  const day = 86400000, now = Date.now();
+  const groups = [['Today', entries.filter(e => now - e.updatedAt < day)], ['Earlier', entries.filter(e => now - e.updatedAt >= day)]];
+  list.innerHTML = groups.filter(g => g[1].length).map(([label, items]) =>
+    `<div class="session-group">${label}</div>` + items.map(e => {
+      const depts = e.departments || [], assessed = depts.filter(d => d.assessed).length, docs = depts.filter(d => d.received).length;
+      const meta = depts.length ? `<b>${assessed}/${depts.length}</b> assessed` : 'no company yet';
+      return `<div class="session ${e.sessionId === sessionId ? 'active' : ''}" onclick="loadConversation('${e.sessionId}')">
+        <div class="session-title">${esc(e.title)}</div>
+        <div class="session-meta"><span>${relTime(e.updatedAt)}</span><span>${meta}</span></div>
+        <button class="session-del" onclick="event.stopPropagation(); confirmDelete('${e.sessionId}')" title="Delete session">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+        </button></div>`;
+    }).join('')).join('');
 }
-function chatItemHTML(entry) {
-  const isActive = entry.sessionId === sessionId;
-  const timeStr = formatRelativeTime(entry.updatedAt);
-  const count = (entry.received || []).length;
-  const badge = count ? `<span class="chat-item-badge">${count} dept${count > 1 ? 's' : ''}</span>` : '';
-  return `
-    <div class="chat-item ${isActive ? 'active' : ''}" onclick="loadConversation('${entry.sessionId}')">
-      <div class="chat-item-title">${escapeHtml(entry.title)}</div>
-      <div class="chat-item-meta">${timeStr} ${badge}</div>
-      <button class="chat-item-delete" onclick="event.stopPropagation(); confirmDelete('${entry.sessionId}')" title="Delete">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="3 6 5 6 21 6"></polyline>
-          <path d="M19 6l-1 14H6L5 6"></path>
-          <path d="M10 11v6M14 11v6"></path>
-        </svg>
-      </button>
-    </div>`;
-}
-function formatRelativeTime(ts) {
-  const diff = Date.now() - ts;
-  if (diff < 60000) return 'Just now';
-  if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
-  if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
-  return Math.floor(diff / 86400000) + 'd ago';
-}
+function relTime(ts) { const d = Date.now() - ts; if (d < 6e4) return 'just now'; if (d < 36e5) return Math.floor(d / 6e4) + 'm ago'; if (d < 864e5) return Math.floor(d / 36e5) + 'h ago'; return Math.floor(d / 864e5) + 'd ago'; }
 
-// ── Load a past session ──
 function loadConversation(id) {
-  const all = loadAllChats();
-  const entry = all[id];
-  if (!entry) return;
-
+  const entry = loadAllChats()[id]; if (!entry) return;
   saveCurrentConversation();
-
-  sessionId = id;
-  currentMessages = entry.messages || [];
-  receivedDepartments = entry.received || [];
-  departments = entry.departments || [];
-  companyName = entry.companyName || '';
-  updateSessionLabel();
-
-  const msgDiv = document.getElementById('messages');
-  msgDiv.innerHTML = '';
-  addBanner('resumed', `Session resumed — ${currentMessages.length} messages loaded`);
-  currentMessages.forEach(m => renderMessageInUI(m.role, m.text, m.time));
-
-  renderDeptChecklist();
-  renderSidebar();
-  scrollToBottom();
+  sessionId = id; currentMessages = entry.messages || []; receivedDepartments = entry.received || [];
+  departments = entry.departments || []; companyName = entry.companyName || ''; runningDept = null; prevState = {};
+  $('messages').innerHTML = '';
+  addNote('info', `Session resumed — ${currentMessages.length} messages`);
+  currentMessages.forEach(m => renderMessage(m.role, m.text, m.time, m.files));
+  departments.forEach(d => prevState[d.folderName] = stateOf(d));
+  updateSessionLabel(); renderBoard(); renderSidebar(); scrollBottom();
 }
-
-// ── New session ──
 function newConversation() {
   saveCurrentConversation();
-
-  sessionId = generateSessionId();
-  currentMessages = [];
-  receivedDepartments = [];
-  departments = [];
-  companyName = '';
-  isLoading = false;
-
-  updateSessionLabel();
-  renderDeptChecklist();
-
-  document.getElementById('messages').innerHTML = `
-    <div class="empty-state" id="empty-state">
-      <div class="empty-icon">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-          <polyline points="14 2 14 8 20 8"></polyline>
-        </svg>
-      </div>
-      <div class="empty-title">New discovery session started</div>
-      <div class="empty-sub">Pick a department, attach its documents, and I'll file them into Drive.</div>
-      <div class="suggestion-chips">
-        <span class="chip" onclick="useChip(this)">What documents do you need?</span>
-        <span class="chip" onclick="useChip(this)">Let's start with Legal</span>
-        <span class="chip" onclick="useChip(this)">Let's start with Finance</span>
-      </div>
-    </div>`;
-
-  document.getElementById('send-btn').disabled = true;
-  document.getElementById('user-input').value = '';
-  renderSidebar();
+  sessionId = generateSessionId(); currentMessages = []; receivedDepartments = []; departments = []; companyName = ''; runningDept = null; prevState = {}; isLoading = false;
+  attachedFiles = []; renderAttachments();
+  $('user-input').value = ''; $('send-btn').disabled = true; $('status-dot').className = 'conn';
+  renderEmpty(); updateSessionLabel(); renderBoard(); renderSidebar();
 }
+function confirmDelete(id) { if (!confirm('Delete this session from this browser? Files in Drive are not affected.')) return; deleteChat(id); id === sessionId ? newConversation() : renderSidebar(); }
 
-// ── Delete ──
-function confirmDelete(id) {
-  if (!confirm('Delete this session?')) return;
-  deleteChat(id);
-  if (id === sessionId) newConversation();
-  else renderSidebar();
+// ── Messages ──
+function renderEmpty() {
+  $('messages').innerHTML = `<div class="empty" id="empty-state">
+    <h2>Which company are we assessing?</h2>
+    <p>Tell me the company and its departments. I'll set up the Drive folders, file every document you attach into the right department, and run each department's assessment when you say so.</p>
+    <div class="chips">
+      <button class="chip" onclick="useChip(this)">Assessment for ABC Ltd — Legal, Finance, HR</button>
+      <button class="chip" onclick="useChip(this)">What do you need from each department?</button>
+    </div></div>`;
 }
-
-// ── Message rendering ──
-function renderMessageInUI(role, text, time) {
-  const div = document.createElement('div');
-  div.className = `message ${role}`;
-  const initials = role === 'user' ? 'You' : 'AI';
-  div.innerHTML = `
-    <div class="msg-avatar">${initials}</div>
-    <div class="msg-body">
-      <div class="msg-bubble">${escapeHtml(text)}</div>
-      <div class="msg-time">${time || ''}</div>
-    </div>`;
-  document.getElementById('messages').appendChild(div);
+function renderMessage(role, text, time, files) {
+  const el = document.createElement('div');
+  el.className = `msg ${role}`;
+  const filesHtml = files && files.length ? `<div class="files-sent">${files.map(f => `<span><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>${esc(f)}</span>`).join('')}</div>` : '';
+  el.innerHTML = `<div class="avatar">${role === 'user' ? 'You' : 'AI'}</div><div><div class="bubble">${role === 'agent' ? md(text) : (esc(text) || '')}${filesHtml}</div><div class="stamp">${time || ''}</div></div>`;
+  $('messages').appendChild(el);
 }
-function addMessage(role, text) {
-  removeEmptyState();
-  const time = getTime();
-  renderMessageInUI(role, text, time);
-  currentMessages.push({ role, text, time });
-  scrollToBottom();
+function addMessage(role, text, files) {
+  const es = $('empty-state'); if (es) es.remove();
+  const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  renderMessage(role, text, time, files);
+  currentMessages.push({ role, text, time, files });
+  scrollBottom();
 }
-function addBanner(type, text) {
-  const div = document.createElement('div');
-  div.className = type === 'error' ? 'error-banner' : type === 'resumed' ? 'resumed-banner' : 'spec-banner';
-  div.textContent = text;
-  document.getElementById('messages').appendChild(div);
-  scrollToBottom();
+function addNote(type, html, id) {
+  const el = document.createElement('div');
+  el.className = 'note' + (type === 'error' ? ' error' : type === 'working' ? ' working' : '');
+  if (id) el.id = id;
+  el.innerHTML = html;
+  $('messages').appendChild(el); scrollBottom(); return el;
 }
-
-// ── Typing indicator ──
 function showTyping() {
-  removeEmptyState();
-  const div = document.createElement('div');
-  div.className = 'typing-wrap';
-  div.id = 'typing';
-  div.innerHTML = `
-    <div class="msg-avatar" style="background:#E1F5EE;color:#0F6E56;border:1px solid #9FE1CB;width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;flex-shrink:0;">AI</div>
-    <div class="typing-bubble">
-      <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-    </div>`;
-  document.getElementById('messages').appendChild(div);
-  scrollToBottom();
+  const es = $('empty-state'); if (es) es.remove();
+  const el = document.createElement('div'); el.className = 'typing'; el.id = 'typing';
+  el.innerHTML = `<div class="avatar" style="background:var(--docs-soft);color:var(--docs)">AI</div><div class="bubble"><i></i><i></i><i></i></div>`;
+  $('messages').appendChild(el); scrollBottom();
 }
-function removeTyping() {
-  const t = document.getElementById('typing');
-  if (t) t.remove();
+function removeTyping() { const t = $('typing'); if (t) t.remove(); }
+
+// Markdown-lite for agent replies: **bold**, `code`, bullet lines. Escaped first, so it is safe.
+function md(text) {
+  const lines = esc(text || '').split('<br>');
+  let html = '', inList = false;
+  for (const raw of lines) {
+    const line = raw.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>');
+    const m = line.match(/^\s*(?:•|-|\*|\d+\.)\s+(.*)$/);
+    if (m) { if (!inList) { html += '<ul>'; inList = true; } html += `<li>${m[1]}</li>`; }
+    else { if (inList) { html += '</ul>'; inList = false; } if (line.trim()) html += `<p>${line}</p>`; }
+  }
+  if (inList) html += '</ul>';
+  return html;
 }
 
-// ── File attachments ──
-function onFilesSelected(fileList) {
-  const files = Array.from(fileList);
-  let rejected = [];
-  const readers = files.map(file => {
-    if (file.size > MAX_FILE_SIZE) {
-      rejected.push(`${file.name} (too large, max 8MB)`);
-      return Promise.resolve(null);
-    }
-    return new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const base64 = reader.result.split(',')[1];
-        resolve({ name: file.name, type: file.type || 'application/octet-stream', size: file.size, data: base64 });
-      };
-      reader.onerror = () => { rejected.push(`${file.name} (failed to read)`); resolve(null); };
-      reader.readAsDataURL(file);
-    });
-  });
-  Promise.all(readers).then(results => {
+// ── Attachments ──
+function onFilesSelected(fileList) { addFiles(Array.from(fileList)); $('file-input').value = ''; }
+function addFiles(files) {
+  const rejected = [];
+  Promise.all(files.map(file => {
+    if (file.size > MAX_FILE_SIZE) { rejected.push(`${file.name} (over 8 MB)`); return null; }
+    return new Promise(res => { const r = new FileReader(); r.onload = () => res({ name: file.name, type: file.type || 'application/octet-stream', size: file.size, data: r.result.split(',')[1] }); r.onerror = () => { rejected.push(file.name); res(null); }; r.readAsDataURL(file); });
+  })).then(results => {
     results.filter(Boolean).forEach(f => attachedFiles.push(f));
-    if (rejected.length) alert('Some files were skipped:\n' + rejected.join('\n'));
-    renderFilePreview();
-    document.getElementById('file-input').value = '';
-    const input = document.getElementById('user-input');
-    document.getElementById('send-btn').disabled = (!input.value.trim() && attachedFiles.length === 0) || isLoading;
+    if (rejected.length) addNote('error', 'Skipped: ' + rejected.map(esc).join(', '));
+    renderAttachments(); syncSend();
   });
 }
-function removeAttachedFile(index) {
-  attachedFiles.splice(index, 1);
-  renderFilePreview();
-  const input = document.getElementById('user-input');
-  document.getElementById('send-btn').disabled = (!input.value.trim() && attachedFiles.length === 0) || isLoading;
+function removeAttachedFile(i) { attachedFiles.splice(i, 1); renderAttachments(); syncSend(); }
+function renderAttachments() {
+  $('file-preview-row').innerHTML = attachedFiles.map((f, i) => `<div class="file-chip"><span title="${esc(f.name)}">${esc(f.name.length > 28 ? f.name.slice(0, 25) + '…' : f.name)}</span><small>${fmtSize(f.size)}</small><button onclick="removeAttachedFile(${i})" title="Remove">✕</button></div>`).join('');
 }
-function renderFilePreview() {
-  const row = document.getElementById('file-preview-row');
-  if (attachedFiles.length === 0) {
-    row.style.display = 'none';
-    row.innerHTML = '';
-    return;
-  }
-  row.style.display = 'flex';
-  row.innerHTML =
-    `<span class="file-preview-dept">→ department detected automatically</span>` +
-    attachedFiles.map((f, i) => `
-    <div class="file-chip">
-      <span class="file-chip-name" title="${escapeHtml(f.name)}">${escapeHtml(truncateName(f.name))}</span>
-      <span class="file-chip-size">${formatFileSize(f.size)}</span>
-      <button class="file-chip-remove" onclick="removeAttachedFile(${i})" title="Remove">✕</button>
-    </div>`).join('');
-}
-function truncateName(name) {
-  return name.length > 22 ? name.slice(0, 19) + '…' : name;
-}
-function formatFileSize(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
-  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+function fmtSize(b) { return b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB'; }
+function setupDragDrop() {
+  const chat = $('chat'), veil = $('drop-veil'); let depth = 0;
+  chat.addEventListener('dragenter', e => { e.preventDefault(); depth++; veil.classList.add('on'); });
+  chat.addEventListener('dragover', e => e.preventDefault());
+  chat.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; veil.classList.remove('on'); } });
+  chat.addEventListener('drop', e => { e.preventDefault(); depth = 0; veil.classList.remove('on'); if (e.dataTransfer && e.dataTransfer.files.length) addFiles(Array.from(e.dataTransfer.files)); });
 }
 
 // ── Send ──
+const RUN_STEPS = ['Reading the Input folder', 'Extracting text from documents', 'Building the AS-IS registers', 'Checking for gaps', 'Scoring automation', 'Identifying requirements', 'Writing the Excel workbooks', 'Saving to 02 - Outputs'];
 async function sendMessage() {
-  const input = document.getElementById('user-input');
-  const text = input.value.trim();
-  if ((!text && attachedFiles.length === 0) || isLoading) return;
+  const input = $('user-input'), text = input.value.trim();
+  if ((!text && !attachedFiles.length) || isLoading) return;
+  isLoading = true; input.value = ''; input.style.height = 'auto'; $('send-btn').disabled = true;
+  const files = attachedFiles; attachedFiles = []; renderAttachments();
 
-  isLoading = true;
-  input.value = '';
-  input.style.height = 'auto';
-  document.getElementById('send-btn').disabled = true;
-
-  const filesForThisMessage = attachedFiles;
-  attachedFiles = [];
-  renderFilePreview();
-
-  const displayText = filesForThisMessage.length
-    ? (text ? text + '\n' : '') + `📎 Sending ${filesForThisMessage.length} file(s):\n` +
-      filesForThisMessage.map(f => '• ' + f.name).join('\n')
-    : text;
-
-  const chatInputForBackend = text || (
-    filesForThisMessage.length
-      ? `Please file these documents: ${filesForThisMessage.map(f => f.name).join(', ')}.`
-      : ''
-  );
-
-  addMessage('user', displayText);
+  const chatInput = text || `Please file these documents: ${files.map(f => f.name).join(', ')}.`;
+  addMessage('user', text, files.map(f => f.name));
   showTyping();
-  const isAssessment = /^\s*(start|run|assess|evaluate|begin|launch)\b/i.test(text) && !filesForThisMessage.length;
-  if (isAssessment) addBanner('resumed', 'Running the assessment — reading documents and building the reports. This can take a few minutes, please keep this tab open.');
+  $('status-dot').className = 'conn busy';
 
-  const dot = document.getElementById('status-dot');
+  // Assessment run: show which department and cycle through the pipeline stages while we wait.
+  const assess = /^\s*(start|run|assess|evaluate|begin|launch)\b/i.test(text) && !files.length;
+  const answering = departments.some(d => d.awaitingAnswers) && !assess && !files.length;
+  let stepTimer = null;
+  if (assess || answering) {
+    const target = departments.find(d => text.toLowerCase().includes(d.name.toLowerCase())) || departments.find(d => d.awaitingAnswers);
+    if (target) { runningDept = target.folderName; renderBoard(); }
+    let i = answering ? 3 : 0;
+    const note = addNote('working', `<i></i><span class="step">${RUN_STEPS[i]}…</span><span>this takes a few minutes — keep this tab open</span>`, 'working-note');
+    stepTimer = setInterval(() => { i = Math.min(i + 1, RUN_STEPS.length - 1); note.querySelector('.step').textContent = RUN_STEPS[i] + '…'; }, 18000);
+  }
+
   try {
-    const res = await fetch(WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chatInput: chatInputForBackend,
-        sessionId,
-        files: filesForThisMessage.map(f => ({ name: f.name, mimeType: f.type, data: f.data }))
-      })
-    });
-    if (!res.ok) throw new Error(`Server returned ${res.status}`);
-
+    const res = await fetch(WEBHOOK_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatInput, sessionId, files: files.map(f => ({ name: f.name, mimeType: f.type, data: f.data })) }) });
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
     const data = await res.json();
-    removeTyping();
-    dot.className = 'status-dot connected';
-
-    const raw = data.response || data.output || data.message || JSON.stringify(data);
-    addMessage('agent', raw);
-
+    removeTyping(); $('status-dot').className = 'conn connected';
+    addMessage('agent', data.response || data.output || data.message || JSON.stringify(data));
     if (Array.isArray(data.receivedDepartments)) receivedDepartments = data.receivedDepartments;
     if (Array.isArray(data.departments)) departments = data.departments;
     if (typeof data.companyName === 'string') companyName = data.companyName;
-    renderDeptChecklist();
-    saveCurrentConversation();
-
   } catch (err) {
-    removeTyping();
-    dot.className = 'status-dot error';
-    addBanner('error', `Connection failed: ${err.message}. Check the webhook URL and n8n CORS settings.`);
+    removeTyping(); $('status-dot').className = 'conn error';
+    addNote('error', `Couldn't reach the assistant (${esc(err.message)}). Check that the n8n workflow is active and try again.`);
+  } finally {
+    if (stepTimer) clearInterval(stepTimer);
+    const w = $('working-note'); if (w) w.remove();
+    runningDept = null;
   }
-
-  isLoading = false;
-  document.getElementById('send-btn').disabled = !input.value.trim();
+  renderBoard(); updateSessionLabel(); saveCurrentConversation();
+  isLoading = false; syncSend();
 }
 
-// ── Department checklist ──
-function renderDeptChecklist() {
-  const bar = document.getElementById('dept-checklist');
-  const label = companyName ? `${companyName} — documents received:` : 'Documents received:';
-  let html = `<span class="progress-label">${label}</span>`;
+// ── Department board ──
+function stateOf(d) { return d.assessed ? 'done' : d.awaitingAnswers ? 'wait' : d.received ? 'docs' : 'none'; }
+function renderBoard() {
+  $('board-company').textContent = companyName || 'No company yet';
+  const list = $('board-list'), foot = $('board-foot');
   if (!departments.length) {
-    html += '<span class="step-pill" id="no-depts-pill">Set up a company to begin</span>';
-  } else {
-    html += departments.map(d => {
-      const done = d.received || receivedDepartments.includes(d.folderName);
-      const cls = d.assessed ? ' assessed' : (d.awaitingAnswers ? ' active' : (done ? ' done' : ''));
-      const label = d.assessed ? `${d.name} ✓ ${d.automation}%` : (d.awaitingAnswers ? `${d.name} — answer questions` : d.name);
-      const tip = d.assessed ? `${d.folderName} — assessed, ${d.automation}% automated` : (done ? `${d.folderName} — documents received` : `${d.folderName} — no documents yet`);
-      return `<span class="step-pill${cls}" data-dept="${d.folderName}" title="${tip}">${label}</span>`;
-    }).join('');
+    list.innerHTML = '<div class="board-empty">Departments appear here once a company is set up. Each one moves through three stages: documents filed, your answers to any questions, and the completed assessment.</div>';
+    foot.textContent = ''; $('board-count').textContent = 'Departments'; return;
   }
-  bar.innerHTML = html;
+  list.innerHTML = departments.map(d => {
+    const st = stateOf(d), running = runningDept === d.folderName, prev = prevState[d.folderName];
+    const changed = prev !== undefined && prev !== st;
+    const flash = changed ? (st === 'done' ? ' flash-done' : ' flash') : '';
+    const seg = (cls, on, run) => `<div class="seg ${cls}${on ? ' on' : ''}${run ? ' running' : ''}"><i></i></div>`;
+    const stateText = running ? 'assessing…' : st === 'done' ? 'assessed' : st === 'wait' ? 'waiting for your answers' : st === 'docs' ? `${d.files || 1} file${(d.files || 1) === 1 ? '' : 's'} filed` : 'no documents yet';
+    const pct = st === 'done' ? `<div class="dept-pct" data-count="${d.automation ?? 0}">${changed && !REDUCED ? 0 : (d.automation ?? 0)}<small>%</small></div>` : '';
+    const action = st === 'docs' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Start ${esc(d.name)} assessment</button>` : st === 'done' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Run again</button>` : st === 'none' ? `<button onclick="document.getElementById('file-input').click()">Attach ${esc(d.name)} documents</button>` : '';
+    return `<div class="dept${flash}" data-folder="${escAttr(d.folderName)}">
+      <div class="dept-top"><div class="dept-name"><span class="dept-folder">${esc(d.folderName.split(' - ')[0])}</span>${esc(d.name)}</div>${pct}</div>
+      <div class="rail">${seg('docs', st !== 'none')}${seg('wait', st === 'wait' || st === 'done', running)}${seg('done', st === 'done')}</div>
+      <div class="dept-sub"><span class="state ${st}">${stateText}</span><span>${st === 'done' ? 'files in 02 - Outputs' : ''}</span></div>
+      <div class="dept-act">${action}</div></div>`;
+  }).join('');
+  // count-up for newly assessed departments
+  list.querySelectorAll('.dept-pct').forEach(el => { const target = Number(el.dataset.count); if (Number(el.firstChild.textContent) !== target) countUp(el, target); });
+  departments.forEach(d => prevState[d.folderName] = stateOf(d));
+  const assessed = departments.filter(d => d.assessed), docs = departments.filter(d => d.received).length;
+  const avg = assessed.length ? Math.round(assessed.reduce((a, d) => a + (Number(d.automation) || 0), 0) / assessed.length) : null;
+  foot.innerHTML = `<b>${assessed.length} of ${departments.length}</b> assessed · ${docs} with documents${avg !== null ? ` · average automation <b>${avg}%</b>` : ''}`;
+  $('board-count').textContent = `${assessed.length}/${departments.length} assessed`;
 }
+function countUp(el, target) {
+  const start = performance.now(), dur = 900;
+  const tick = now => { const p = Math.min(1, (now - start) / dur), v = Math.round(target * (1 - Math.pow(1 - p, 3))); el.firstChild.textContent = v; if (p < 1) requestAnimationFrame(tick); };
+  requestAnimationFrame(tick);
+}
+function toggleBoard() { $('board').classList.toggle('open'); }
+function quickSend(text) { $('user-input').value = text; onInputChange($('user-input')); sendMessage(); }
 
-// ── Utilities ──
-function generateSessionId() {
-  return 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
-}
-function updateSessionLabel() {
-  document.getElementById('session-label').textContent = `Session: ${sessionId.slice(-10)}`;
-}
-function onInputChange(el) {
-  el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
-  document.getElementById('send-btn').disabled = (!el.value.trim() && attachedFiles.length === 0) || isLoading;
-}
-function handleKeydown(e) {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    if (!isLoading && document.getElementById('user-input').value.trim()) sendMessage();
-  }
-}
-function useChip(el) {
-  document.getElementById('user-input').value = el.textContent;
-  onInputChange(document.getElementById('user-input'));
-  sendMessage();
-}
-function removeEmptyState() {
-  const es = document.getElementById('empty-state');
-  if (es) es.remove();
-}
-function getTime() {
-  return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-function scrollToBottom() {
-  const m = document.getElementById('messages');
-  m.scrollTop = m.scrollHeight;
-}
-function escapeHtml(text) {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\n/g, '<br>');
-}
+// ── Small helpers ──
+function generateSessionId() { return 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7); }
+function updateSessionLabel() { $('chat-title').textContent = companyName ? `${companyName} — AS-IS discovery` : 'New session'; $('session-label').textContent = `Session ${sessionId.slice(-10)}`; }
+function onInputChange(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 140) + 'px'; syncSend(); }
+function syncSend() { $('send-btn').disabled = (!$('user-input').value.trim() && !attachedFiles.length) || isLoading; }
+function handleKeydown(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!isLoading && ($('user-input').value.trim() || attachedFiles.length)) sendMessage(); } }
+function useChip(el) { $('user-input').value = el.textContent; onInputChange($('user-input')); sendMessage(); }
+function scrollBottom() { const m = $('messages'); m.scrollTop = m.scrollHeight; }
+function esc(t) { return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/\n/g, '<br>'); }
+function escAttr(t) { return String(t).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;'); }
