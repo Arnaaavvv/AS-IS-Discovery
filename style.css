@@ -191,3 +191,6 @@ textarea { font: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+/* Fix: keep panels inside the viewport so the message list scrolls */
+.sessions, .chat, .board { min-height: 0; }
+.messages { min-height: 0; }
