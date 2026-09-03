@@ -208,6 +208,7 @@
     }
     .step-pill.active { background: #E1F5EE; color: #0F6E56; border-color: #9FE1CB; }
     .step-pill.done { background: #0F6E56; color: #fff; border-color: #0F6E56; }
+    .step-pill.assessed { background: #1F4E78; color: #fff; border-color: #1F4E78; font-weight: 600; }
 
     /* ───── PIPELINE PROGRESS TRACK ───── */
     .pipeline-track {
@@ -499,3 +500,32 @@
     .send-btn:hover:not(:disabled) { background: #0F6E56; }
     .send-btn:active:not(:disabled) { transform: scale(0.95); }
     .send-btn:disabled { background: #ccc; cursor: default; }
+    /* ───── DEPARTMENT SELECTOR (upload target) ───── */
+    .dept-select {
+      flex-shrink: 0;
+      align-self: flex-end;
+      height: 38px;
+      padding: 0 26px 0 10px;
+      border: 1px solid #e0e0dc;
+      border-radius: 10px;
+      background: #f7f7f4 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23888' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E") no-repeat right 10px center;
+      font-size: 12px;
+      color: #444;
+      cursor: pointer;
+      -webkit-appearance: none;
+      appearance: none;
+      transition: border-color 0.2s;
+    }
+    .dept-select:focus { outline: none; border-color: #1D9E75; background-color: #fff; }
+
+    .file-preview-dept {
+      font-size: 11px;
+      font-weight: 500;
+      color: #0F6E56;
+      background: #E1F5EE;
+      border: 1px solid #9FE1CB;
+      padding: 4px 10px;
+      border-radius: 8px;
+      white-space: nowrap;
+      align-self: center;
+    }
