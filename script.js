@@ -1,6 +1,17 @@
 const WEBHOOK_URL = "https://dtsolutions.app.n8n.cloud/webhook/683536ba-dc5c-4796-89e0-b497f8fa92a4";
-const STORAGE_KEY = 'as_is_discovery_sessions';
+// ── Server session endpoints (build these in n8n — see BACKEND-CHANGES.md) ──
+// SESSIONS_URL  : GET  → [{ sessionId, title, updatedAt, departments }]  (list for the sidebar)
+// LOAD_URL      : POST { sessionId } → { sessionId, title, companyName, departments, received, transcript:[{role,text,time,files}] }
+// DELETE_URL    : POST { sessionId } → { ok:true }   (optional; if absent, delete is local-only)
+// Leave a URL empty ('') to disable that server call and fall back to the browser cache.
+const SESSIONS_URL = "https://dtsolutions.app.n8n.cloud/webhook/as-is-sessions";
+const LOAD_URL = "https://dtsolutions.app.n8n.cloud/webhook/as-is-load";
+const DELETE_URL = "https://dtsolutions.app.n8n.cloud/webhook/as-is-delete";
+const STORAGE_KEY = 'as_is_discovery_sessions';   // cache only — the server is the source of truth
 const MAX_FILE_SIZE = 8 * 1024 * 1024;
+
+let serverIndex = {};   // sessionId -> { sessionId, title, updatedAt, departments }  from SESSIONS_URL
+let serverUp = false;   // did the last sidebar refresh reach the server?
 
 let sessionId = generateSessionId();
 let isLoading = false;
@@ -21,6 +32,7 @@ renderSidebar();
 renderBoard();
 updateSessionLabel();
 setupDragDrop();
+refreshSidebarFromServer();   // pull the authoritative session list; falls back to cache on failure
 
 // ── Storage ──
 function loadAllChats() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch { return {}; } }
@@ -29,8 +41,10 @@ function deleteChat(id) { const all = loadAllChats(); delete all[id]; localStora
 function saveCurrentConversation() {
   if (!currentMessages.length) return;
   const existing = loadAllChats()[sessionId] || {};
-  saveChat(sessionId, { sessionId, title: companyName || existing.title || deriveTitle(), messages: currentMessages,
-    received: receivedDepartments, departments, companyName, updatedAt: Date.now() });
+  saveChat(sessionId, {
+    sessionId, title: companyName || existing.title || deriveTitle(), messages: currentMessages,
+    received: receivedDepartments, departments, companyName, updatedAt: Date.now()
+  });
   renderSidebar();
 }
 function deriveTitle() {
@@ -39,10 +53,37 @@ function deriveTitle() {
   return first.text.length > 40 ? first.text.slice(0, 40) + '…' : first.text;
 }
 
+// ── Server session index (authoritative) with cache fallback ──
+async function refreshSidebarFromServer() {
+  if (!SESSIONS_URL) { serverUp = false; renderSidebar(); return; }
+  try {
+    const res = await fetch(SESSIONS_URL, { method: 'GET' });
+    if (!res.ok) throw new Error(res.status);
+    const rows = await res.json();
+    const list = Array.isArray(rows) ? rows : (rows.sessions || []);
+    serverIndex = {};
+    list.forEach(r => { if (r && r.sessionId) serverIndex[r.sessionId] = r; });
+    serverUp = true;
+  } catch { serverUp = false; }   // server unreachable → sidebar shows the local cache
+  renderSidebar();
+}
+// Merge the server index with the local cache. Server rows win; cache-only rows are shown too so a
+// session started while the endpoint was down is not hidden. Everything is keyed by sessionId.
+function mergedSessions() {
+  const cache = loadAllChats();
+  const out = {};
+  Object.values(cache).forEach(e => { if (e && e.sessionId) out[e.sessionId] = { ...e, _src: 'cache' }; });
+  Object.values(serverIndex).forEach(r => {
+    const prev = out[r.sessionId] || {};
+    out[r.sessionId] = { ...prev, ...r, updatedAt: r.updatedAt ? new Date(r.updatedAt).getTime() : prev.updatedAt || Date.now(), _src: 'server' };
+  });
+  return Object.values(out);
+}
+
 // ── Sidebar ──
 function renderSidebar() {
   const list = $('sidebar-list');
-  const entries = Object.values(loadAllChats()).sort((a, b) => b.updatedAt - a.updatedAt);
+  const entries = mergedSessions().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   if (!entries.length) { list.innerHTML = '<div class="session-empty">Sessions you start will be listed here so you can come back to a company later.</div>'; return; }
   const day = 86400000, now = Date.now();
   const groups = [['Today', entries.filter(e => now - e.updatedAt < day)], ['Earlier', entries.filter(e => now - e.updatedAt >= day)]];
@@ -60,15 +101,26 @@ function renderSidebar() {
 }
 function relTime(ts) { const d = Date.now() - ts; if (d < 6e4) return 'just now'; if (d < 36e5) return Math.floor(d / 6e4) + 'm ago'; if (d < 864e5) return Math.floor(d / 36e5) + 'h ago'; return Math.floor(d / 864e5) + 'd ago'; }
 
-function loadConversation(id) {
-  const entry = loadAllChats()[id]; if (!entry) return;
+async function loadConversation(id) {
   saveCurrentConversation();
+  // Prefer the server (survives a hard browser reset / a different device); fall back to the cache.
+  let entry = null, fromServer = false;
+  if (LOAD_URL) {
+    try {
+      const res = await fetch(LOAD_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: id }) });
+      if (res.ok) { const d = await res.json(); if (d && (d.transcript || d.departments)) { entry = { sessionId: id, messages: d.transcript || [], received: d.received || [], departments: d.departments || [], companyName: d.companyName || d.title || '' }; fromServer = true; } }
+    } catch { /* fall through to cache */ }
+  }
+  if (!entry) entry = loadAllChats()[id];
+  if (!entry) { addNote('error', "Couldn't load that session from the server, and it isn't cached in this browser."); return; }
+
   sessionId = id; currentMessages = entry.messages || []; receivedDepartments = entry.received || [];
   departments = entry.departments || []; companyName = entry.companyName || ''; runningDept = null; prevState = {};
   $('messages').innerHTML = '';
-  addNote('info', `Session resumed — ${currentMessages.length} messages`);
+  addNote('info', `Session resumed — ${currentMessages.length} messages${fromServer ? '' : ' (from this browser)'}`);
   currentMessages.forEach(m => renderMessage(m.role, m.text, m.time, m.files));
   departments.forEach(d => prevState[d.folderName] = stateOf(d));
+  saveCurrentConversation();   // refresh the local cache from what we just loaded
   updateSessionLabel(); renderBoard(); renderSidebar(); scrollBottom();
 }
 function newConversation() {
@@ -78,7 +130,13 @@ function newConversation() {
   $('user-input').value = ''; $('send-btn').disabled = true; $('status-dot').className = 'conn';
   renderEmpty(); updateSessionLabel(); renderBoard(); renderSidebar();
 }
-function confirmDelete(id) { if (!confirm('Delete this session from this browser? Files in Drive are not affected.')) return; deleteChat(id); id === sessionId ? newConversation() : renderSidebar(); }
+function confirmDelete(id) {
+  const msg = DELETE_URL ? 'Delete this session everywhere? Files in Drive are not affected.' : 'Delete this session from this browser? The server copy (if any) is kept. Files in Drive are not affected.';
+  if (!confirm(msg)) return;
+  deleteChat(id);
+  if (DELETE_URL) { fetch(DELETE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: id }) }).then(() => { delete serverIndex[id]; renderSidebar(); }).catch(() => { }); }
+  id === sessionId ? newConversation() : renderSidebar();
+}
 
 // ── Messages ──
 function renderEmpty() {
@@ -185,8 +243,10 @@ async function sendMessage() {
   }
 
   try {
-    const res = await fetch(WEBHOOK_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chatInput, sessionId, files: files.map(f => ({ name: f.name, mimeType: f.type, data: f.data })) }) });
+    const res = await fetch(WEBHOOK_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatInput, sessionId, files: files.map(f => ({ name: f.name, mimeType: f.type, data: f.data })) })
+    });
     if (!res.ok) throw new Error(`server returned ${res.status}`);
     const data = await res.json();
     removeTyping(); $('status-dot').className = 'conn connected';
@@ -203,6 +263,7 @@ async function sendMessage() {
     runningDept = null;
   }
   renderBoard(); updateSessionLabel(); saveCurrentConversation();
+  refreshSidebarFromServer();   // pick up the server's title/updatedAt for this session
   isLoading = false; syncSend();
 }
 
