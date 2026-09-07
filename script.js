@@ -138,7 +138,7 @@ function confirmDelete(id) {
   id === sessionId ? newConversation() : renderSidebar();
 }
 
-// ── Messages ──
+// ── Messagess ──
 function renderEmpty() {
   $('messages').innerHTML = `<div class="empty" id="empty-state">
     <h2>Which company are we assessing?</h2>
