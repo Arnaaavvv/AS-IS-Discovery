@@ -28,10 +28,10 @@ body {
 button { font: inherit; cursor: pointer; }
 textarea { font: inherit; }
 
-.app { display: grid; grid-template-columns: 250px 1fr 320px; height: 100vh; height: 100dvh; overflow: hidden; }
+.app { display: grid; grid-template-columns: 250px 1fr 320px; grid-template-rows: 100%; height: 100vh; height: 100dvh; overflow: hidden; }
 
 /* ── Sessions sidebar ─────────────────────────────── */
-.sessions { background: var(--ink); color: #DDE3EF; display: flex; flex-direction: column; padding: 18px 14px; gap: 14px; min-width: 0; }
+.sessions { background: var(--ink); color: #DDE3EF; display: flex; flex-direction: column; padding: 18px 14px; gap: 14px; min-width: 0; height: 100%; overflow: hidden; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px 8px; }
 .brand-mark { width: 30px; height: 30px; border-radius: 8px; background: #21315A; display: grid; grid-template-columns: 1fr; gap: 3px; padding: 7px; }
 .brand-mark span { display: block; height: 3px; border-radius: 2px; background: #7FA6E8; }
@@ -55,8 +55,8 @@ textarea { font: inherit; }
 .session-empty { color: #93A0BD; font-size: 13px; padding: 14px 10px; line-height: 1.5; }
 
 /* ── Chat ─────────────────────────────────────────── */
-.chat { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
-.chat-head { display: flex; align-items: center; gap: 12px; padding: 14px 24px; background: var(--card); border-bottom: 1px solid var(--line); }
+.chat { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; position: relative; overflow: hidden; }
+.chat-head { display: flex; align-items: center; gap: 12px; padding: 14px 24px; background: var(--card); border-bottom: 1px solid var(--line); flex-shrink: 0; }
 .chat-head > div:first-child { flex: 1; min-width: 0; }
 .chat-title { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-sub { font-size: 12.5px; color: var(--mute); }
@@ -72,7 +72,7 @@ textarea { font: inherit; }
 .msg { display: flex; gap: 10px; max-width: 72ch; animation: rise .32s var(--ease) both; }
 .msg.user { align-self: flex-end; flex-direction: row-reverse; }
 @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-.avatar { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; font-size: 11.5px; font-weight: 600; flex-shrink: 0; margin-top: 2px; }
+.avatar { width: 30px; height: 30px; border-radius: 999px; display: grid; place-items: center; font-size: 11.5px; font-weight: 600; flex-shrink: 0; margin-top: 2px; }
 .msg.agent .avatar { background: var(--docs-soft); color: var(--docs); }
 .msg.user .avatar { background: #E4E9F5; color: var(--user); }
 .bubble { padding: 11px 15px; border-radius: var(--radius); background: var(--card); border: 1px solid var(--line); word-wrap: break-word; }
@@ -114,7 +114,7 @@ textarea { font: inherit; }
 .drop-veil.on .drop-card { transform: scale(1); }
 
 /* Composer */
-.composer { padding: 10px 24px 14px; background: linear-gradient(to top, var(--paper) 70%, transparent); }
+.composer { padding: 10px 24px 14px; background: var(--paper); border-top: 1px solid rgba(227, 230, 236, 0.7); flex-shrink: 0; z-index: 2; }
 .attach-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .attach-row:empty { display: none; }
 .file-chip { display: inline-flex; align-items: center; gap: 8px; padding: 6px 8px 6px 10px; border-radius: 10px; background: var(--card); border: 1px solid var(--line); font-size: 13px; animation: rise .25s var(--ease) both; }
@@ -133,8 +133,8 @@ textarea { font: inherit; }
 .composer-hint { font-size: 11.5px; color: #98A0B2; margin: 6px 4px 0; }
 
 /* ── Department board ─────────────────────────────── */
-.board { background: var(--card); border-left: 1px solid var(--line); display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.board-head { padding: 18px 18px 12px; border-bottom: 1px solid var(--line); position: relative; }
+.board { background: var(--card); border-left: 1px solid var(--line); display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
+.board-head { padding: 18px 18px 12px; border-bottom: 1px solid var(--line); position: relative; flex-shrink: 0; }
 .board-close { display: none; position: absolute; right: 12px; top: 14px; width: 28px; height: 28px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--mute); }
 .board-company { font-weight: 600; font-size: 15px; letter-spacing: -.01em; }
 .board-legend { display: flex; gap: 12px; margin-top: 8px; font-size: 11.5px; color: var(--mute); flex-wrap: wrap; }
@@ -168,19 +168,19 @@ textarea { font: inherit; }
 .dept:hover .dept-act { display: block; }
 .dept-act button { padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); font-size: 12.5px; color: var(--ink-2); transition: all .15s; }
 .dept-act button:hover { border-color: var(--done); color: var(--done); background: var(--done-soft); }
-.board-foot { padding: 12px 18px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--mute); min-height: 44px; }
+.board-foot { padding: 12px 18px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--mute); min-height: 44px; flex-shrink: 0; }
 .board-foot b { color: var(--ink); font-weight: 500; }
 
 /* ── Responsive ───────────────────────────────────── */
 @media (max-width: 1100px) {
-  .app { grid-template-columns: 220px 1fr; }
+  .app { grid-template-columns: 220px 1fr; grid-template-rows: 100%; }
   .board { position: fixed; right: 0; top: 0; bottom: 0; width: 320px; max-width: 90vw; transform: translateX(100%); transition: transform .3s var(--ease); box-shadow: -12px 0 30px rgba(20,33,61,.12); z-index: 20; }
   .board.open { transform: none; }
   .board-toggle { display: inline-flex; }
   .board-close { display: grid; place-items: center; }
 }
 @media (max-width: 720px) {
-  .app { grid-template-columns: 1fr; }
+  .app { grid-template-columns: 1fr; grid-template-rows: 100%; }
   .sessions { display: none; }
   .messages { padding: 16px 14px 8px; }
   .composer { padding: 8px 12px 12px; }
