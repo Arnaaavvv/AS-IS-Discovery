@@ -165,7 +165,9 @@ textarea { font: inherit; }
 .dept-sub .state { font-weight: 500; }
 .dept-sub .state.docs { color: var(--docs); } .dept-sub .state.wait { color: var(--wait); } .dept-sub .state.done { color: var(--done); }
 .dept-act { margin-top: 8px; display: none; }
-.dept:hover .dept-act { display: block; }
+.dept:hover .dept-act, .dept.enterprise .dept-act { display: flex; gap: 6px; flex-wrap: wrap; }
+.dept.enterprise { border-top: 1px dashed var(--line); border-radius: 0; margin-top: 8px; padding-top: 14px; }
+.dept.enterprise .dept-name { font-weight: 600; }
 .dept-act button { padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); font-size: 12.5px; color: var(--ink-2); transition: all .15s; }
 .dept-act button:hover { border-color: var(--done); color: var(--done); background: var(--done-soft); }
 .board-foot { padding: 12px 18px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--mute); min-height: 44px; flex-shrink: 0; }

@@ -20,6 +20,7 @@ let attachedFiles = [];
 let receivedDepartments = [];
 let departments = [];           // [{name, folderName, received, assessed, automation, awaitingAnswers}]
 let companyName = '';
+let enterprise = { assessed: false };   // {assessed, automation, maturityLevel, maturityScore, blocksAssessed, blocksTotal, departmentsCount}
 let runningDept = null;         // department key currently being assessed (UI only)
 let prevState = {};             // folderName -> state, to animate changes
 
@@ -43,7 +44,7 @@ function saveCurrentConversation() {
   const existing = loadAllChats()[sessionId] || {};
   saveChat(sessionId, {
     sessionId, title: companyName || existing.title || deriveTitle(), messages: currentMessages,
-    received: receivedDepartments, departments, companyName, updatedAt: Date.now()
+    received: receivedDepartments, departments, companyName, enterprise, updatedAt: Date.now()
   });
   renderSidebar();
 }
@@ -108,14 +109,14 @@ async function loadConversation(id) {
   if (LOAD_URL) {
     try {
       const res = await fetch(LOAD_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: id }) });
-      if (res.ok) { const d = await res.json(); if (d && (d.transcript || d.departments)) { entry = { sessionId: id, messages: d.transcript || [], received: d.received || [], departments: d.departments || [], companyName: d.companyName || d.title || '' }; fromServer = true; } }
+      if (res.ok) { const d = await res.json(); if (d && (d.transcript || d.departments)) { entry = { sessionId: id, messages: d.transcript || [], received: d.received || [], departments: d.departments || [], companyName: d.companyName || d.title || '', enterprise: d.enterprise || { assessed: false } }; fromServer = true; } }
     } catch { /* fall through to cache */ }
   }
   if (!entry) entry = loadAllChats()[id];
   if (!entry) { addNote('error', "Couldn't load that session from the server, and it isn't cached in this browser."); return; }
 
   sessionId = id; currentMessages = entry.messages || []; receivedDepartments = entry.received || [];
-  departments = entry.departments || []; companyName = entry.companyName || ''; runningDept = null; prevState = {};
+  departments = entry.departments || []; companyName = entry.companyName || ''; enterprise = entry.enterprise || { assessed: false }; runningDept = null; prevState = {};
   $('messages').innerHTML = '';
   addNote('info', `Session resumed — ${currentMessages.length} messages${fromServer ? '' : ' (from this browser)'}`);
   currentMessages.forEach(m => renderMessage(m.role, m.text, m.time, m.files));
@@ -125,7 +126,7 @@ async function loadConversation(id) {
 }
 function newConversation() {
   saveCurrentConversation();
-  sessionId = generateSessionId(); currentMessages = []; receivedDepartments = []; departments = []; companyName = ''; runningDept = null; prevState = {}; isLoading = false;
+  sessionId = generateSessionId(); currentMessages = []; receivedDepartments = []; departments = []; companyName = ''; enterprise = { assessed: false }; runningDept = null; prevState = {}; isLoading = false;
   attachedFiles = []; renderAttachments();
   $('user-input').value = ''; $('send-btn').disabled = true; $('status-dot').className = 'conn';
   renderEmpty(); updateSessionLabel(); renderBoard(); renderSidebar();
@@ -225,16 +226,17 @@ async function sendMessage() {
   isLoading = true; input.value = ''; input.style.height = 'auto'; $('send-btn').disabled = true;
   const files = attachedFiles; attachedFiles = []; renderAttachments();
 
-  const chatInput = text || `Please file these documents: ${files.map(f => f.name).join(', ')}.`;
+  const chatInput = text || 'Please file the attached documents.';
   addMessage('user', text, files.map(f => f.name));
   showTyping();
   $('status-dot').className = 'conn busy';
 
   // Assessment run: show which department and cycle through the pipeline stages while we wait.
-  const assess = /^\s*(start|run|assess|evaluate|begin|launch)\b/i.test(text) && !files.length;
-  const answering = departments.some(d => d.awaitingAnswers) && !assess && !files.length;
+  const enterpriseRun = !files.length && /enterprise/i.test(text);
+  const assess = !files.length && !enterpriseRun && /(assess|evaluat|analy[sz]e|\brun\b|\bstart\b|kick[\s-]?off|go ahead|begin|launch)/i.test(text);
+  const answering = departments.some(d => d.awaitingAnswers) && !assess && !enterpriseRun && !files.length;
   let stepTimer = null;
-  if (assess || answering) {
+  if (assess || answering || enterpriseRun) {
     const target = departments.find(d => text.toLowerCase().includes(d.name.toLowerCase())) || departments.find(d => d.awaitingAnswers);
     if (target) { runningDept = target.folderName; renderBoard(); }
     let i = answering ? 3 : 0;
@@ -254,6 +256,7 @@ async function sendMessage() {
     if (Array.isArray(data.receivedDepartments)) receivedDepartments = data.receivedDepartments;
     if (Array.isArray(data.departments)) departments = data.departments;
     if (typeof data.companyName === 'string') companyName = data.companyName;
+    if (data.enterprise && typeof data.enterprise === 'object') enterprise = data.enterprise;
   } catch (err) {
     removeTyping(); $('status-dot').className = 'conn error';
     addNote('error', `Couldn't reach the assistant (${esc(err.message)}). Check that the n8n workflow is active and try again.`);
@@ -276,6 +279,21 @@ function renderBoard() {
     list.innerHTML = '<div class="board-empty">Departments appear here once a company is set up. Each one moves through three stages: documents filed, your answers to any questions, and the completed assessment.</div>';
     foot.textContent = ''; $('board-count').textContent = 'Departments'; return;
   }
+  // Enterprise card: the cross-department consolidation, shown under the departments.
+  const entAssessed = !!(enterprise && enterprise.assessed);
+  const entPct = (entAssessed && enterprise.automation != null) ? `<div class="dept-pct" data-count="${enterprise.automation}">${enterprise.automation}<small>%</small></div>` : '';
+  const entState = entAssessed
+    ? `assessed${enterprise.maturityLevel ? ` · ${esc(enterprise.maturityLevel)}${enterprise.maturityScore != null ? ` (${enterprise.maturityScore}/5)` : ''}` : ''}`
+    : 'not run yet';
+  const entRight = entAssessed
+    ? (enterprise.blocksAssessed != null ? `${enterprise.blocksAssessed}/${enterprise.blocksTotal} blocks` : 'consolidated')
+    : `${departments.filter(d => d.assessed).length}/${departments.length} departments assessed`;
+  const entSeg = on => `<div class="seg done${on ? ' on' : ''}"><i></i></div>`;
+  const entCard = `<div class="dept enterprise">
+      <div class="dept-top"><div class="dept-name">Enterprise</div>${entPct}</div>
+      <div class="rail">${entSeg(entAssessed)}${entSeg(entAssessed)}${entSeg(entAssessed)}</div>
+      <div class="dept-sub"><span class="state ${entAssessed ? 'done' : ''}">${entState}</span><span>${entRight}</span></div>
+      <div class="dept-act"><button onclick="quickSend('Create Enterprise Assessment')">${entAssessed ? 'Run again' : 'Create enterprise assessment'}</button></div></div>`;
   list.innerHTML = departments.map(d => {
     const st = stateOf(d), running = runningDept === d.folderName, prev = prevState[d.folderName];
     const changed = prev !== undefined && prev !== st;
@@ -283,13 +301,13 @@ function renderBoard() {
     const seg = (cls, on, run) => `<div class="seg ${cls}${on ? ' on' : ''}${run ? ' running' : ''}"><i></i></div>`;
     const stateText = running ? 'assessing…' : st === 'done' ? 'assessed' : st === 'wait' ? 'waiting for your answers' : st === 'docs' ? `${d.files || 1} file${(d.files || 1) === 1 ? '' : 's'} filed` : 'no documents yet';
     const pct = st === 'done' ? `<div class="dept-pct" data-count="${d.automation ?? 0}">${changed && !REDUCED ? 0 : (d.automation ?? 0)}<small>%</small></div>` : '';
-    const action = st === 'docs' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Start ${esc(d.name)} assessment</button>` : st === 'done' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Run again</button>` : st === 'none' ? `<button onclick="document.getElementById('file-input').click()">Attach ${esc(d.name)} documents</button>` : '';
+    const action = st === 'docs' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Start ${esc(d.name)} assessment</button>` : st === 'done' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Run again</button><button onclick="document.getElementById('file-input').click()">Add files</button>` : st === 'none' ? `<button onclick="document.getElementById('file-input').click()">Attach ${esc(d.name)} documents</button>` : '';
     return `<div class="dept${flash}" data-folder="${escAttr(d.folderName)}">
       <div class="dept-top"><div class="dept-name"><span class="dept-folder">${esc(d.folderName.split(' - ')[0])}</span>${esc(d.name)}</div>${pct}</div>
       <div class="rail">${seg('docs', st !== 'none')}${seg('wait', st === 'wait' || st === 'done', running)}${seg('done', st === 'done')}</div>
       <div class="dept-sub"><span class="state ${st}">${stateText}</span><span>${st === 'done' ? 'files in 02 - Outputs' : ''}</span></div>
       <div class="dept-act">${action}</div></div>`;
-  }).join('');
+  }).join('') + entCard;
   // count-up for newly assessed departments
   list.querySelectorAll('.dept-pct').forEach(el => { const target = Number(el.dataset.count); if (Number(el.firstChild.textContent) !== target) countUp(el, target); });
   departments.forEach(d => prevState[d.folderName] = stateOf(d));
