@@ -165,13 +165,42 @@ textarea { font: inherit; }
 .dept-sub .state { font-weight: 500; }
 .dept-sub .state.docs { color: var(--docs); } .dept-sub .state.wait { color: var(--wait); } .dept-sub .state.done { color: var(--done); }
 .dept-act { margin-top: 8px; display: none; }
-.dept:hover .dept-act, .dept.enterprise .dept-act { display: flex; gap: 6px; flex-wrap: wrap; }
-.dept.enterprise { border-top: 1px dashed var(--line); border-radius: 0; margin-top: 8px; padding-top: 14px; }
-.dept.enterprise .dept-name { font-weight: 600; }
+.dept:hover .dept-act { display: block; }
 .dept-act button { padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); font-size: 12.5px; color: var(--ink-2); transition: all .15s; }
 .dept-act button:hover { border-color: var(--done); color: var(--done); background: var(--done-soft); }
 .board-foot { padding: 12px 18px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--mute); min-height: 44px; flex-shrink: 0; }
 .board-foot b { color: var(--ink); font-weight: 500; }
+
+
+/* ── Enterprise card ─────────────────────────────── */
+.dept.ent { margin-top: 10px; border-top: 1px dashed var(--line); border-radius: 0 0 12px 12px; padding-top: 16px; }
+.dept.ent:hover { background: transparent; }
+.dept.ent .dept-name { font-weight: 600; }
+.ent-seg.ok > i { background: var(--done); }
+.ent-seg.warn > i { background: var(--wait); }
+.ent-seg.err > i { background: var(--err); }
+.ent-seg.running > i { transform: scaleX(1) !important; background: linear-gradient(90deg, var(--done-soft), var(--done), var(--done-soft)); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
+.ent-stages { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; margin-top: 3px; font-size: 10.5px; color: #98A0B2; }
+.dept-sub .state.ent-complete { color: var(--done); }
+.dept-sub .state.ent-running, .dept-sub .state.ent-partial, .dept-sub .state.ent-blocked { color: var(--wait); }
+.dept-sub .state.ent-failed { color: var(--err); }
+.dept-sub .state.ent-ready, .dept-sub .state.ent-locked { color: var(--mute); }
+.dept-pct.muted { color: var(--mute); }
+.ent-facts { list-style: none; margin: 10px 0 0; padding: 0; font-size: 12.5px; color: var(--ink-2); display: grid; gap: 3px; }
+.ent-facts.muted { color: var(--mute); }
+.ent-facts b { font-weight: 500; color: var(--ink); }
+.ent-alert { margin-top: 10px; padding: 9px 11px; border-radius: 10px; font-size: 12.5px; line-height: 1.45; }
+.ent-alert b { display: block; font-weight: 600; margin-bottom: 2px; }
+.ent-alert p { margin: 2px 0 0; }
+.ent-alert ul { margin: 4px 0 0; padding-left: 16px; }
+.ent-alert.warn { background: var(--wait-soft); color: #7C3A06; }
+.ent-alert.err { background: var(--err-soft); color: var(--err); }
+.ent-hint { margin: 8px 0 0; font-size: 12.5px; color: var(--mute); }
+.ent-act { margin-top: 10px; display: none; }
+.ent-act.show, .dept.ent:hover .ent-act { display: block; }
+.ent-act button { padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); font-size: 12.5px; color: var(--ink-2); transition: all .15s; }
+.ent-act button:hover { border-color: var(--done); color: var(--done); background: var(--done-soft); }
+.ent-act button:focus-visible, .dept-act button:focus-visible { outline: 2px solid var(--done); outline-offset: 2px; }
 
 /* ── Responsive ───────────────────────────────────── */
 @media (max-width: 1100px) {

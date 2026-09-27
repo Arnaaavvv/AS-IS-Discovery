@@ -20,9 +20,11 @@ let attachedFiles = [];
 let receivedDepartments = [];
 let departments = [];           // [{name, folderName, received, assessed, automation, awaitingAnswers}]
 let companyName = '';
-let enterprise = { assessed: false };   // {assessed, automation, maturityLevel, maturityScore, blocksAssessed, blocksTotal, departmentsCount}
 let runningDept = null;         // department key currently being assessed (UI only)
 let prevState = {};             // folderName -> state, to animate changes
+let enterprise = null;          // normalised enterprise state from the server (see normEnt)
+let entRun = null;              // { step } while an enterprise run is in flight (UI only)
+let recoverToken = 0;           // cancels a background "did it finish?" check when a new message is sent
 
 const $ = id => document.getElementById(id);
 const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -44,7 +46,7 @@ function saveCurrentConversation() {
   const existing = loadAllChats()[sessionId] || {};
   saveChat(sessionId, {
     sessionId, title: companyName || existing.title || deriveTitle(), messages: currentMessages,
-    received: receivedDepartments, departments, companyName, enterprise, updatedAt: Date.now()
+    received: receivedDepartments, departments, enterprise, companyName, updatedAt: Date.now()
   });
   renderSidebar();
 }
@@ -109,14 +111,15 @@ async function loadConversation(id) {
   if (LOAD_URL) {
     try {
       const res = await fetch(LOAD_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: id }) });
-      if (res.ok) { const d = await res.json(); if (d && (d.transcript || d.departments)) { entry = { sessionId: id, messages: d.transcript || [], received: d.received || [], departments: d.departments || [], companyName: d.companyName || d.title || '', enterprise: d.enterprise || { assessed: false } }; fromServer = true; } }
+      if (res.ok) { const d = await res.json(); if (d && (d.transcript || d.departments)) { entry = { sessionId: id, messages: d.transcript || [], received: d.received || [], departments: d.departments || [], enterprise: d.enterprise || null, companyName: d.companyName || d.title || '' }; fromServer = true; } }
     } catch { /* fall through to cache */ }
   }
   if (!entry) entry = loadAllChats()[id];
   if (!entry) { addNote('error', "Couldn't load that session from the server, and it isn't cached in this browser."); return; }
 
   sessionId = id; currentMessages = entry.messages || []; receivedDepartments = entry.received || [];
-  departments = entry.departments || []; companyName = entry.companyName || ''; enterprise = entry.enterprise || { assessed: false }; runningDept = null; prevState = {};
+  departments = entry.departments || []; companyName = entry.companyName || ''; runningDept = null; prevState = {};
+  recoverToken++; entRun = null; enterprise = resolveEnterprise(entry.enterprise);
   $('messages').innerHTML = '';
   addNote('info', `Session resumed — ${currentMessages.length} messages${fromServer ? '' : ' (from this browser)'}`);
   currentMessages.forEach(m => renderMessage(m.role, m.text, m.time, m.files));
@@ -126,7 +129,8 @@ async function loadConversation(id) {
 }
 function newConversation() {
   saveCurrentConversation();
-  sessionId = generateSessionId(); currentMessages = []; receivedDepartments = []; departments = []; companyName = ''; enterprise = { assessed: false }; runningDept = null; prevState = {}; isLoading = false;
+  sessionId = generateSessionId(); currentMessages = []; receivedDepartments = []; departments = []; companyName = ''; runningDept = null; prevState = {}; isLoading = false;
+  enterprise = null; entRun = null; recoverToken++;
   attachedFiles = []; renderAttachments();
   $('user-input').value = ''; $('send-btn').disabled = true; $('status-dot').className = 'conn';
   renderEmpty(); updateSessionLabel(); renderBoard(); renderSidebar();
@@ -226,17 +230,27 @@ async function sendMessage() {
   isLoading = true; input.value = ''; input.style.height = 'auto'; $('send-btn').disabled = true;
   const files = attachedFiles; attachedFiles = []; renderAttachments();
 
-  const chatInput = text || 'Please file the attached documents.';
+  const chatInput = text || `Please file these documents: ${files.map(f => f.name).join(', ')}.`;
   addMessage('user', text, files.map(f => f.name));
   showTyping();
   $('status-dot').className = 'conn busy';
 
+  // Enterprise run: same trigger phrases the backend routes on (Prepare Input → enterpriseIntent).
+  const entRunNow = ENTERPRISE_RE.test(text) && !files.length && departments.length > 0;
   // Assessment run: show which department and cycle through the pipeline stages while we wait.
-  const enterpriseRun = !files.length && /enterprise/i.test(text);
-  const assess = !files.length && !enterpriseRun && /(assess|evaluat|analy[sz]e|\brun\b|\bstart\b|kick[\s-]?off|go ahead|begin|launch)/i.test(text);
-  const answering = departments.some(d => d.awaitingAnswers) && !assess && !enterpriseRun && !files.length;
+  const assess = !entRunNow && /^\s*(start|run|assess|evaluate|begin|launch)\b/i.test(text) && !files.length;
+  const answering = !entRunNow && departments.some(d => d.awaitingAnswers) && !assess && !files.length;
+  const sentAt = Date.now(), sentSid = sessionId, myToken = ++recoverToken;
   let stepTimer = null;
-  if (assess || answering || enterpriseRun) {
+  if (entRunNow) {
+    entRun = { step: 0 }; renderBoard();
+    const note = addNote('working', `<i></i><span class="step">${ENT_STEPS[0]}…</span><span>this takes a few minutes — keep this tab open</span>`, 'working-note');
+    stepTimer = setInterval(() => {
+      if (!entRun) return;
+      entRun.step = Math.min(entRun.step + 1, ENT_STEPS.length - 1);
+      note.querySelector('.step').textContent = ENT_STEPS[entRun.step] + '…'; renderEnterprise();
+    }, 18000);
+  } else if (assess || answering) {
     const target = departments.find(d => text.toLowerCase().includes(d.name.toLowerCase())) || departments.find(d => d.awaitingAnswers);
     if (target) { runningDept = target.folderName; renderBoard(); }
     let i = answering ? 3 : 0;
@@ -256,14 +270,17 @@ async function sendMessage() {
     if (Array.isArray(data.receivedDepartments)) receivedDepartments = data.receivedDepartments;
     if (Array.isArray(data.departments)) departments = data.departments;
     if (typeof data.companyName === 'string') companyName = data.companyName;
-    if (data.enterprise && typeof data.enterprise === 'object') enterprise = data.enterprise;
+    enterprise = resolveEnterprise(data.enterprise);
   } catch (err) {
     removeTyping(); $('status-dot').className = 'conn error';
-    addNote('error', `Couldn't reach the assistant (${esc(err.message)}). Check that the n8n workflow is active and try again.`);
+    const longRun = entRunNow || assess || answering;
+    addNote('error', `Couldn't reach the assistant (${esc(err.message)}).${longRun ? ' The run may still be finishing on the server — checking below.' : ' Check that the n8n workflow is active and try again.'}`);
+    if (entRunNow) enterprise = { ...(enterprise || normEnt(null)), status: 'failed', lastError: `No reply from the server (${err.message}).`, lastRunAt: new Date().toISOString() };
+    if (longRun) recoverAfterError(sentSid, sentAt, myToken);
   } finally {
     if (stepTimer) clearInterval(stepTimer);
     const w = $('working-note'); if (w) w.remove();
-    runningDept = null;
+    runningDept = null; entRun = null;
   }
   renderBoard(); updateSessionLabel(); saveCurrentConversation();
   refreshSidebarFromServer();   // pick up the server's title/updatedAt for this session
@@ -279,21 +296,6 @@ function renderBoard() {
     list.innerHTML = '<div class="board-empty">Departments appear here once a company is set up. Each one moves through three stages: documents filed, your answers to any questions, and the completed assessment.</div>';
     foot.textContent = ''; $('board-count').textContent = 'Departments'; return;
   }
-  // Enterprise card: the cross-department consolidation, shown under the departments.
-  const entAssessed = !!(enterprise && enterprise.assessed);
-  const entPct = (entAssessed && enterprise.automation != null) ? `<div class="dept-pct" data-count="${enterprise.automation}">${enterprise.automation}<small>%</small></div>` : '';
-  const entState = entAssessed
-    ? `assessed${enterprise.maturityLevel ? ` · ${esc(enterprise.maturityLevel)}${enterprise.maturityScore != null ? ` (${enterprise.maturityScore}/5)` : ''}` : ''}`
-    : 'not run yet';
-  const entRight = entAssessed
-    ? (enterprise.blocksAssessed != null ? `${enterprise.blocksAssessed}/${enterprise.blocksTotal} blocks` : 'consolidated')
-    : `${departments.filter(d => d.assessed).length}/${departments.length} departments assessed`;
-  const entSeg = on => `<div class="seg done${on ? ' on' : ''}"><i></i></div>`;
-  const entCard = `<div class="dept enterprise">
-      <div class="dept-top"><div class="dept-name">Enterprise</div>${entPct}</div>
-      <div class="rail">${entSeg(entAssessed)}${entSeg(entAssessed)}${entSeg(entAssessed)}</div>
-      <div class="dept-sub"><span class="state ${entAssessed ? 'done' : ''}">${entState}</span><span>${entRight}</span></div>
-      <div class="dept-act"><button onclick="quickSend('Create Enterprise Assessment')">${entAssessed ? 'Run again' : 'Create enterprise assessment'}</button></div></div>`;
   list.innerHTML = departments.map(d => {
     const st = stateOf(d), running = runningDept === d.folderName, prev = prevState[d.folderName];
     const changed = prev !== undefined && prev !== st;
@@ -301,21 +303,183 @@ function renderBoard() {
     const seg = (cls, on, run) => `<div class="seg ${cls}${on ? ' on' : ''}${run ? ' running' : ''}"><i></i></div>`;
     const stateText = running ? 'assessing…' : st === 'done' ? 'assessed' : st === 'wait' ? 'waiting for your answers' : st === 'docs' ? `${d.files || 1} file${(d.files || 1) === 1 ? '' : 's'} filed` : 'no documents yet';
     const pct = st === 'done' ? `<div class="dept-pct" data-count="${d.automation ?? 0}">${changed && !REDUCED ? 0 : (d.automation ?? 0)}<small>%</small></div>` : '';
-    const action = st === 'docs' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Start ${esc(d.name)} assessment</button>` : st === 'done' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Run again</button><button onclick="document.getElementById('file-input').click()">Add files</button>` : st === 'none' ? `<button onclick="document.getElementById('file-input').click()">Attach ${esc(d.name)} documents</button>` : '';
+    const action = st === 'docs' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Start ${esc(d.name)} assessment</button>` : st === 'done' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Run again</button>` : st === 'none' ? `<button onclick="document.getElementById('file-input').click()">Attach ${esc(d.name)} documents</button>` : '';
     return `<div class="dept${flash}" data-folder="${escAttr(d.folderName)}">
       <div class="dept-top"><div class="dept-name"><span class="dept-folder">${esc(d.folderName.split(' - ')[0])}</span>${esc(d.name)}</div>${pct}</div>
       <div class="rail">${seg('docs', st !== 'none')}${seg('wait', st === 'wait' || st === 'done', running)}${seg('done', st === 'done')}</div>
       <div class="dept-sub"><span class="state ${st}">${stateText}</span><span>${st === 'done' ? 'files in 02 - Outputs' : ''}</span></div>
       <div class="dept-act">${action}</div></div>`;
-  }).join('') + entCard;
+  }).join('');
   // count-up for newly assessed departments
   list.querySelectorAll('.dept-pct').forEach(el => { const target = Number(el.dataset.count); if (Number(el.firstChild.textContent) !== target) countUp(el, target); });
   departments.forEach(d => prevState[d.folderName] = stateOf(d));
   const assessed = departments.filter(d => d.assessed), docs = departments.filter(d => d.received).length;
   const avg = assessed.length ? Math.round(assessed.reduce((a, d) => a + (Number(d.automation) || 0), 0) / assessed.length) : null;
+  renderEnterprise();
   foot.innerHTML = `<b>${assessed.length} of ${departments.length}</b> assessed · ${docs} with documents${avg !== null ? ` · average automation <b>${avg}%</b>` : ''}`;
   $('board-count').textContent = `${assessed.length}/${departments.length} assessed`;
 }
+// ── Enterprise card ──
+const ENTERPRISE_RE = /(enterprise\s+assessment|enterprise\s+report|consolidat)/i;
+const ENT_STEPS = ['Collecting each department\'s results', 'Consolidating the AS-IS', 'Rolling up automation', 'Consolidating requirements', 'Scoring the 77 building blocks', 'Writing the enterprise workbooks', 'Saving to Enterprise Assessment'];
+
+// Same shape the backend's entView() returns; tolerant of the older { assessed, automation, ... } payload.
+function normEnt(e) {
+  e = e || {};
+  const n = v => (v == null || v === '' || !isFinite(Number(v))) ? null : Number(v);
+  const arr = v => Array.isArray(v) ? v : [];
+  return {
+    assessed: !!e.assessed, status: e.status || (e.assessed ? 'complete' : 'not_run'),
+    automation: n(e.automation), maturityLevel: e.maturityLevel || '', maturityScore: n(e.maturityScore),
+    blocksAssessed: n(e.blocksAssessed), blocksTotal: n(e.blocksTotal), blocksNotRelevant: n(e.blocksNotRelevant),
+    departmentsCount: n(e.departmentsCount), files: arr(e.files), filesExpected: n(e.filesExpected),
+    issues: arr(e.issues), notes: arr(e.notes), incompleteDepartments: arr(e.incompleteDepartments),
+    lastError: e.lastError || '', completedAt: e.completedAt || null, lastRunAt: e.lastRunAt || e.completedAt || null
+  };
+}
+// Server state first. If the server has nothing (older backend that dropped `enterprise` from its reply),
+// rebuild it from the enterprise messages already in the chat so a finished run is never shown as "not run yet".
+function resolveEnterprise(serverEnt) {
+  const e = normEnt(serverEnt);
+  if (e.assessed || e.status !== 'not_run') return e;
+  return enterpriseFromTranscript(currentMessages) || e;
+}
+function enterpriseFromTranscript(msgs) {
+  let latest = null;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]; if (!m || m.role !== 'agent') continue;
+    const t = String(m.text || ''), when = isoOf(m.time);
+    if (/^\s*Enterprise Digital Maturity Assessment (complete|finished with gaps)/i.test(t)) {
+      const num = re => { const x = t.match(re); return x ? Number(x[1]) : null; };
+      const mat = t.match(/Digital maturity:\s*(.*?)\s*\(([\d.]+|N\/A) of 5\),\s*(\d+) of (\d+) building blocks/i);
+      const list = head => { const p = t.split(head)[1]; if (!p) return []; return p.split('\n').slice(1).map(l => l.trim()).filter((l, k, a) => l && a.slice(0, k + 1).every(x => /^[•\-*]/.test(x))).map(l => l.replace(/^[•\-*]\s*/, '')); };
+      const issues = list(/What's incomplete:/i), files = list(/Files saved[^\n]*/i);
+      const auto = num(/Enterprise automation:\s*([\d.]+)%/i);
+      if (auto == null && !issues.length) issues.push('Enterprise automation score could not be calculated.');
+      const ok = normEnt({
+        assessed: true, status: issues.length ? 'partial' : 'complete', automation: auto,
+        maturityLevel: mat && mat[1] !== 'N/A' ? mat[1] : '', maturityScore: mat && mat[2] !== 'N/A' ? Number(mat[2]) : null,
+        blocksAssessed: mat ? Number(mat[3]) : null, blocksTotal: mat ? Number(mat[4]) : null,
+        departmentsCount: num(/Consolidated (\d+) departments/i), files, issues, completedAt: when
+      });
+      return latest ? { ...ok, status: latest.status, lastError: latest.lastError, incompleteDepartments: latest.incompleteDepartments, lastRunAt: latest.lastRunAt } : ok;
+    }
+    if (latest) continue;   // already found the latest attempt; keep looking only for the last good result
+    if (/^\s*The enterprise assessment could not be completed:?\s*/i.test(t))
+      latest = normEnt({ status: 'failed', lastError: t.replace(/^\s*The enterprise assessment could not be completed:?\s*/i, '').split('\n')[0], lastRunAt: when });
+    else if (/^\s*Enterprise assessment not started/i.test(t)) {
+      const inc = (t.match(/Still incomplete:\s*([^.\n]*)/i) || [])[1] || '';
+      latest = normEnt({ status: 'blocked', incompleteDepartments: inc.split(',').map(x => x.trim()).filter(x => x && x !== 'none'), lastRunAt: when });
+    }
+  }
+  return latest;
+}
+function isoOf(t) { const d = new Date(t); return isNaN(d) ? null : d.toISOString(); }
+
+function entState() {
+  const e = enterprise || normEnt(null);
+  const total = departments.length, done = departments.filter(d => d.assessed).length;
+  if (entRun) return 'running';
+  if (e.status === 'failed') return 'failed';
+  if (e.status === 'blocked' && done < total) return 'blocked';
+  if (e.assessed) return e.status === 'partial' ? 'partial' : 'complete';
+  return (total && done === total) ? 'ready' : 'locked';
+}
+function renderEnterprise() {
+  const list = $('board-list'); if (!list || !departments.length) return;
+  let card = $('ent-card');
+  if (!card) { card = document.createElement('div'); card.id = 'ent-card'; list.appendChild(card); }
+  const e = enterprise || normEnt(null), st = entState();
+  const total = departments.length, done = departments.filter(d => d.assessed).length;
+  const hasResult = e.assessed;
+  const stale = hasResult && e.departmentsCount != null && done > e.departmentsCount;
+  const scorable = e.blocksTotal != null ? e.blocksTotal - (e.blocksNotRelevant || 0) : null;
+  const blockFrac = hasResult && scorable ? Math.min(1, (e.blocksAssessed || 0) / scorable) : hasResult ? 1 : 0;
+
+  // Three stages: departments ready → consolidation (AS-IS, automation, requirements) → 77-block maturity.
+  const seg = (frac, tone, run, title) => `<div class="seg ent-seg ${tone}${run ? ' running' : ''}" title="${escAttr(title)}"><i style="transform:scaleX(${run ? 1 : frac})"></i></div>`;
+  const runStage = entRun ? (entRun.step < 4 ? 2 : 3) : 0;
+  const bad = st === 'failed' && !hasResult;
+  const tone1 = bad ? 'err' : 'ok';
+  const tone2 = bad ? 'err' : (hasResult && e.automation == null) ? 'warn' : 'ok';
+  const tone3 = bad ? 'err' : (hasResult && blockFrac < 1) || st === 'partial' ? 'warn' : 'ok';
+  const rail = `<div class="rail">
+    ${seg(entRun ? 1 : total ? done / total : 0, tone1, false, `${done} of ${total} departments assessed`)}
+    ${seg(entRun ? (runStage > 2 ? 1 : 0) : bad ? 1 : hasResult ? 1 : 0, tone2, runStage === 2, 'Consolidation')}
+    ${seg(entRun ? 0 : bad ? 1 : blockFrac, tone3, runStage === 3, hasResult && e.blocksTotal ? `${e.blocksAssessed} of ${e.blocksTotal} building blocks scored` : 'Building-block maturity')}
+  </div><div class="ent-stages"><span>departments</span><span>consolidation</span><span>maturity</span></div>`;
+
+  const when = t => { if (!t) return ''; const d = new Date(t); return isNaN(d) ? '' : relTime(d.getTime()); };
+  const stateText = {
+    running: 'assessing…', locked: 'not ready', ready: 'not run yet',
+    complete: 'assessed', partial: 'partial result', failed: 'last run failed', blocked: 'blocked'
+  }[st];
+  const right = st === 'running' ? esc(ENT_STEPS[entRun.step]) : (st === 'complete' || st === 'partial') ? esc(when(e.completedAt)) : `${done}/${total} departments assessed`;
+  const pct = hasResult && st !== 'running' ? `<div class="dept-pct${st === 'failed' ? ' muted' : ''}">${e.automation == null ? '—' : e.automation}<small>%</small></div>` : '';
+
+  let body = '';
+  if (hasResult && st !== 'running') {
+    const facts = [];
+    if (e.maturityLevel || e.maturityScore != null) facts.push(`Maturity <b>${esc(e.maturityLevel || 'N/A')}</b>${e.maturityScore != null ? ` (${e.maturityScore} of 5)` : ''}`);
+    if (e.blocksTotal != null) facts.push(`${e.blocksAssessed ?? 0} of ${e.blocksTotal} building blocks scored${e.blocksNotRelevant ? `, ${e.blocksNotRelevant} not relevant` : ''}`);
+    if (e.departmentsCount != null) facts.push(`${e.departmentsCount} department${e.departmentsCount === 1 ? '' : 's'} consolidated`);
+    if (e.files.length) facts.push(`${e.files.length}${e.filesExpected ? ` of ${e.filesExpected}` : ''} files in Enterprise Assessment`);
+    body += `<ul class="ent-facts${st === 'failed' ? ' muted' : ''}">${facts.map(f => `<li>${f}</li>`).join('')}</ul>`;
+  }
+  if (st === 'partial' && e.issues.length)
+    body += `<div class="ent-alert warn"><b>What's incomplete</b><ul>${e.issues.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>`;
+  if (st === 'failed')
+    body += `<div class="ent-alert err"><b>The last run didn't finish${e.lastRunAt ? ` (${esc(when(e.lastRunAt))})` : ''}</b><p>${esc(e.lastError || 'Unknown error.')}</p>${hasResult ? `<p>The figures above are from the previous run${e.completedAt ? `, ${esc(when(e.completedAt))}` : ''}.</p>` : ''}</div>`;
+  if (st === 'blocked')
+    body += `<div class="ent-alert warn"><b>Assess these departments first</b><p>${esc(e.incompleteDepartments.join(', ') || departments.filter(d => !d.assessed).map(d => d.name).join(', '))}</p></div>`;
+  if (st === 'locked')
+    body += `<p class="ent-hint">Runs once every department is assessed — ${total - done} to go.</p>`;
+  if (stale && st !== 'running')
+    body += `<div class="ent-alert warn"><b>Out of date</b><p>${done - e.departmentsCount} department${done - e.departmentsCount === 1 ? ' was' : 's were'} assessed after this run. Run it again to include ${done - e.departmentsCount === 1 ? 'it' : 'them'}.</p></div>`;
+
+  const canRun = done === total && total > 0 && !entRun;
+  const label = st === 'ready' ? 'Create enterprise assessment' : st === 'failed' ? 'Try again' : 'Run again';
+  const urgent = st === 'ready' || st === 'failed' || st === 'partial' || stale;
+  const action = canRun && st !== 'locked' ? `<div class="ent-act${urgent ? ' show' : ''}"><button onclick="quickSend('Create Enterprise Assessment')">${label}</button></div>` : '';
+
+  card.className = `dept ent ent-${st}`;
+  card.innerHTML = `<div class="dept-top"><div class="dept-name">Enterprise</div>${pct}</div>${rail}
+    <div class="dept-sub"><span class="state ent-${st}">${stateText}</span><span>${right}</span></div>${body}${action}`;
+}
+
+// A long run can outlive the HTTP request (proxy timeout) while n8n keeps going and saves the result.
+// After an error, poll the saved session for a few minutes and pick the result up if it lands.
+async function recoverAfterError(sid, since, token) {
+  if (!LOAD_URL) return;
+  const note = addNote('working', '<i></i><span>Checking whether the run finished on the server…</span>');
+  for (let k = 0; k < 12; k++) {
+    await new Promise(r => setTimeout(r, 20000));
+    if (token !== recoverToken || sid !== sessionId) { note.remove(); return; }
+    try {
+      const res = await fetch(LOAD_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sid }) });
+      if (!res.ok) continue;
+      const d = await res.json(), tr = Array.isArray(d.transcript) ? d.transcript : [];
+      const last = tr[tr.length - 1];
+      if (!last || last.role !== 'agent' || new Date(last.time).getTime() < since - 5000) continue;
+      if (token !== recoverToken || sid !== sessionId) { note.remove(); return; }
+      note.remove();
+      addNote('info', 'The run finished on the server — here is its reply.');
+      const es = $('empty-state'); if (es) es.remove();
+      renderMessage('agent', last.text, last.time, last.files);
+      currentMessages.push({ role: 'agent', text: last.text, time: last.time, files: last.files || [] });
+      if (Array.isArray(d.departments)) departments = d.departments;
+      if (Array.isArray(d.received)) receivedDepartments = d.received;
+      if (d.companyName) companyName = d.companyName;
+      enterprise = resolveEnterprise(d.enterprise);
+      $('status-dot').className = 'conn connected';
+      renderBoard(); updateSessionLabel(); saveCurrentConversation(); scrollBottom();
+      return;
+    } catch { /* keep trying */ }
+  }
+  note.remove();
+  addNote('error', 'No result arrived on the server for that run. Send the message again to retry.');
+}
+
 function countUp(el, target) {
   const start = performance.now(), dur = 900;
   const tick = now => { const p = Math.min(1, (now - start) / dur), v = Math.round(target * (1 - Math.pow(1 - p, 3))); el.firstChild.textContent = v; if (p < 1) requestAnimationFrame(tick); };
