@@ -1,3 +1,4 @@
+// AS-IS Discovery frontend — build v3 (stop button + cross department)
 const WEBHOOK_URL = "https://dtsolutions.app.n8n.cloud/webhook/683536ba-dc5c-4796-89e0-b497f8fa92a4";
 // ── Server session endpoints (build these in n8n — see BACKEND-CHANGES.md) ──
 // SESSIONS_URL  : GET  → [{ sessionId, title, updatedAt, departments }]  (list for the sidebar)
