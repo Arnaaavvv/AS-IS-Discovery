@@ -202,6 +202,27 @@ textarea { font: inherit; }
 .ent-act button:hover { border-color: var(--done); color: var(--done); background: var(--done-soft); }
 .ent-act button:focus-visible, .dept-act button:focus-visible { outline: 2px solid var(--done); outline-offset: 2px; }
 
+/* Stop */
+.send.stop { background: var(--err); }
+.send.stop:not(:disabled):hover { background: #8F1C13; transform: none; }
+.send.stop:disabled { background: #D9A29C; }
+.stop-btn { border-color: var(--err-soft) !important; color: var(--err) !important; }
+.stop-btn:hover { background: var(--err-soft) !important; border-color: var(--err) !important; }
+.dept.is-running .dept-act, .dept-act.show { display: block; }
+.ent-alert.neutral { background: #EDF0F5; color: var(--ink-2); }
+.dept-sub .state.ent-stopped { color: var(--mute); }
+.dept.ent .dept-sub { gap: 12px; }
+.dept.ent .dept-sub > span:last-child { text-align: right; }
+.dept.ent .dept-sub > span:first-child { white-space: nowrap; }
+
+/* Cross Department */
+.dept.cross { border: 1px dashed #C9D2E0; margin-top: 6px; }
+.dept.cross .dept-name::after { content: "shared"; margin-left: 8px; padding: 1px 7px; border-radius: 999px; background: var(--docs-soft); color: var(--docs); font-size: 11px; font-weight: 500; vertical-align: 1px; }
+.dept.cross.missing { background: var(--paper); }
+.dept.cross.missing .dept-name { color: var(--mute); }
+.cross-note { margin-top: 6px; font-size: 12px; line-height: 1.45; color: var(--mute); }
+.dept-act button:disabled { opacity: .5; cursor: default; }
+
 /* ── Responsive ───────────────────────────────────── */
 @media (max-width: 1100px) {
   .app { grid-template-columns: 220px 1fr; grid-template-rows: 100%; }

@@ -7,6 +7,8 @@ const WEBHOOK_URL = "https://dtsolutions.app.n8n.cloud/webhook/683536ba-dc5c-479
 const SESSIONS_URL = "https://dtsolutions.app.n8n.cloud/webhook/as-is-sessions";
 const LOAD_URL = "https://dtsolutions.app.n8n.cloud/webhook/as-is-load";
 const DELETE_URL = "https://dtsolutions.app.n8n.cloud/webhook/as-is-delete";
+// STOP_URL    : POST { sessionId, text, kind, since } → { stopped:true, note } | { stopped:false, reason:'finished'|'none' }
+const STOP_URL = "https://dtsolutions.app.n8n.cloud/webhook/as-is-stop";
 const STORAGE_KEY = 'as_is_discovery_sessions';   // cache only — the server is the source of truth
 const MAX_FILE_SIZE = 8 * 1024 * 1024;
 
@@ -25,6 +27,11 @@ let prevState = {};             // folderName -> state, to animate changes
 let enterprise = null;          // normalised enterprise state from the server (see normEnt)
 let entRun = null;              // { step } while an enterprise run is in flight (UI only)
 let recoverToken = 0;           // cancels a background "did it finish?" check when a new message is sent
+let activeRun = null;           // { controller, sid, text, kind, since, startMs, stopping } while a request is in flight
+
+// Cross Department is permanent but optional: while it has no documents it never blocks anything.
+const isCross = d => /^\s*cross[\s_-]*department\s*$/i.test(String((d && d.name) || ''));
+const countable = d => !(isCross(d) && !d.received);
 
 const $ = id => document.getElementById(id);
 const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -92,7 +99,7 @@ function renderSidebar() {
   const groups = [['Today', entries.filter(e => now - e.updatedAt < day)], ['Earlier', entries.filter(e => now - e.updatedAt >= day)]];
   list.innerHTML = groups.filter(g => g[1].length).map(([label, items]) =>
     `<div class="session-group">${label}</div>` + items.map(e => {
-      const depts = e.departments || [], assessed = depts.filter(d => d.assessed).length, docs = depts.filter(d => d.received).length;
+      const depts = (e.departments || []).filter(countable), assessed = depts.filter(d => d.assessed).length, docs = depts.filter(d => d.received).length;
       const meta = depts.length ? `<b>${assessed}/${depts.length}</b> assessed` : 'no company yet';
       return `<div class="session ${e.sessionId === sessionId ? 'active' : ''}" onclick="loadConversation('${e.sessionId}')">
         <div class="session-title">${esc(e.title)}</div>
@@ -241,6 +248,10 @@ async function sendMessage() {
   const assess = !entRunNow && /^\s*(start|run|assess|evaluate|begin|launch)\b/i.test(text) && !files.length;
   const answering = !entRunNow && departments.some(d => d.awaitingAnswers) && !assess && !files.length;
   const sentAt = Date.now(), sentSid = sessionId, myToken = ++recoverToken;
+  const controller = new AbortController();
+  activeRun = { controller, sid: sessionId, text: chatInput, kind: entRunNow ? 'enterprise' : (assess || answering) ? 'assess' : 'other',
+                since: new Date(sentAt).toISOString(), startMs: sentAt, stopping: false };
+  setSendMode(true);
   let stepTimer = null;
   if (entRunNow) {
     entRun = { step: 0 }; renderBoard();
@@ -260,7 +271,7 @@ async function sendMessage() {
 
   try {
     const res = await fetch(WEBHOOK_URL, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
       body: JSON.stringify({ chatInput, sessionId, files: files.map(f => ({ name: f.name, mimeType: f.type, data: f.data })) })
     });
     if (!res.ok) throw new Error(`server returned ${res.status}`);
@@ -272,15 +283,19 @@ async function sendMessage() {
     if (typeof data.companyName === 'string') companyName = data.companyName;
     enterprise = resolveEnterprise(data.enterprise);
   } catch (err) {
-    removeTyping(); $('status-dot').className = 'conn error';
+    removeTyping();
+    if (err.name === 'AbortError') { /* the user pressed Stop — stopRun() reports the outcome */ }
+    else {
+    $('status-dot').className = 'conn error';
     const longRun = entRunNow || assess || answering;
     addNote('error', `Couldn't reach the assistant (${esc(err.message)}).${longRun ? ' The run may still be finishing on the server — checking below.' : ' Check that the n8n workflow is active and try again.'}`);
     if (entRunNow) enterprise = { ...(enterprise || normEnt(null)), status: 'failed', lastError: `No reply from the server (${err.message}).`, lastRunAt: new Date().toISOString() };
     if (longRun) recoverAfterError(sentSid, sentAt, myToken);
+    }
   } finally {
     if (stepTimer) clearInterval(stepTimer);
     const w = $('working-note'); if (w) w.remove();
-    runningDept = null; entRun = null;
+    runningDept = null; entRun = null; activeRun = null; setSendMode(false);
   }
   renderBoard(); updateSessionLabel(); saveCurrentConversation();
   refreshSidebarFromServer();   // pick up the server's title/updatedAt for this session
@@ -301,23 +316,28 @@ function renderBoard() {
     const changed = prev !== undefined && prev !== st;
     const flash = changed ? (st === 'done' ? ' flash-done' : ' flash') : '';
     const seg = (cls, on, run) => `<div class="seg ${cls}${on ? ' on' : ''}${run ? ' running' : ''}"><i></i></div>`;
-    const stateText = running ? 'assessing…' : st === 'done' ? 'assessed' : st === 'wait' ? 'waiting for your answers' : st === 'docs' ? `${d.files || 1} file${(d.files || 1) === 1 ? '' : 's'} filed` : 'no documents yet';
+    const cross = isCross(d);
+    const stateText = running ? 'assessing…' : st === 'done' ? 'assessed' : st === 'wait' ? 'waiting for your answers' : st === 'docs' ? `${d.files || 1} file${(d.files || 1) === 1 ? '' : 's'} filed` : cross ? 'optional — no shared documents yet' : 'no documents yet';
     const pct = st === 'done' ? `<div class="dept-pct" data-count="${d.automation ?? 0}">${changed && !REDUCED ? 0 : (d.automation ?? 0)}<small>%</small></div>` : '';
-    const action = st === 'docs' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Start ${esc(d.name)} assessment</button>` : st === 'done' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Run again</button>` : st === 'none' ? `<button onclick="document.getElementById('file-input').click()">Attach ${esc(d.name)} documents</button>` : '';
-    return `<div class="dept${flash}" data-folder="${escAttr(d.folderName)}">
+    const action = running ? `<button class="stop-btn" onclick="stopRun()">Stop</button>` : st === 'docs' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Start ${esc(d.name)} assessment</button>` : st === 'done' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Run again</button>` : st === 'none' ? `<button onclick="document.getElementById('file-input').click()">Attach ${cross ? 'cross-department' : esc(d.name)} documents</button>` : '';
+    return `<div class="dept${flash}${cross ? ' cross' : ''}${running ? ' is-running' : ''}" data-folder="${escAttr(d.folderName)}">
       <div class="dept-top"><div class="dept-name"><span class="dept-folder">${esc(d.folderName.split(' - ')[0])}</span>${esc(d.name)}</div>${pct}</div>
       <div class="rail">${seg('docs', st !== 'none')}${seg('wait', st === 'wait' || st === 'done', running)}${seg('done', st === 'done')}</div>
-      <div class="dept-sub"><span class="state ${st}">${stateText}</span><span>${st === 'done' ? 'files in 02 - Outputs' : ''}</span></div>
+      <div class="dept-sub"><span class="state ${st}">${stateText}</span><span>${st === 'done' ? 'files in 02 - Outputs' : ''}</span></div>${cross ? '<div class="cross-note">Documents that cover two or more departments are filed here automatically.</div>' : ''}
       <div class="dept-act">${action}</div></div>`;
-  }).join('');
+  }).join('') + (departments.some(isCross) ? '' : `<div class="dept cross missing">
+      <div class="dept-top"><div class="dept-name">Cross Department</div></div>
+      <div class="cross-note">Not set up for this company yet. It holds documents that cover two or more departments; I'll file them there automatically once it exists.</div>
+      <div class="dept-act show"><button onclick="quickSend('Add Cross Department')" ${activeRun ? 'disabled' : ''}>Add Cross Department folder</button></div></div>`);
   // count-up for newly assessed departments
   list.querySelectorAll('.dept-pct').forEach(el => { const target = Number(el.dataset.count); if (Number(el.firstChild.textContent) !== target) countUp(el, target); });
   departments.forEach(d => prevState[d.folderName] = stateOf(d));
-  const assessed = departments.filter(d => d.assessed), docs = departments.filter(d => d.received).length;
+  const counted = departments.filter(countable);
+  const assessed = counted.filter(d => d.assessed), docs = counted.filter(d => d.received).length;
   const avg = assessed.length ? Math.round(assessed.reduce((a, d) => a + (Number(d.automation) || 0), 0) / assessed.length) : null;
   renderEnterprise();
-  foot.innerHTML = `<b>${assessed.length} of ${departments.length}</b> assessed · ${docs} with documents${avg !== null ? ` · average automation <b>${avg}%</b>` : ''}`;
-  $('board-count').textContent = `${assessed.length}/${departments.length} assessed`;
+  foot.innerHTML = `<b>${assessed.length} of ${counted.length}</b> assessed · ${docs} with documents${avg !== null ? ` · average automation <b>${avg}%</b>` : ''}`;
+  $('board-count').textContent = `${assessed.length}/${counted.length} assessed`;
 }
 // ── Enterprise card ──
 const ENTERPRISE_RE = /(enterprise\s+assessment|enterprise\s+report|consolidat)/i;
@@ -365,7 +385,9 @@ function enterpriseFromTranscript(msgs) {
       return latest ? { ...ok, status: latest.status, lastError: latest.lastError, incompleteDepartments: latest.incompleteDepartments, lastRunAt: latest.lastRunAt } : ok;
     }
     if (latest) continue;   // already found the latest attempt; keep looking only for the last good result
-    if (/^\s*The enterprise assessment could not be completed:?\s*/i.test(t))
+    if (/^\s*Stopped the enterprise assessment/i.test(t))
+      latest = normEnt({ status: 'stopped', lastError: 'Stopped by you.', lastRunAt: when });
+    else if (/^\s*The enterprise assessment could not be completed:?\s*/i.test(t))
       latest = normEnt({ status: 'failed', lastError: t.replace(/^\s*The enterprise assessment could not be completed:?\s*/i, '').split('\n')[0], lastRunAt: when });
     else if (/^\s*Enterprise assessment not started/i.test(t)) {
       const inc = (t.match(/Still incomplete:\s*([^.\n]*)/i) || [])[1] || '';
@@ -378,8 +400,9 @@ function isoOf(t) { const d = new Date(t); return isNaN(d) ? null : d.toISOStrin
 
 function entState() {
   const e = enterprise || normEnt(null);
-  const total = departments.length, done = departments.filter(d => d.assessed).length;
+  const total = departments.filter(countable).length, done = departments.filter(d => countable(d) && d.assessed).length;
   if (entRun) return 'running';
+  if (e.status === 'stopped') return 'stopped';
   if (e.status === 'failed') return 'failed';
   if (e.status === 'blocked' && done < total) return 'blocked';
   if (e.assessed) return e.status === 'partial' ? 'partial' : 'complete';
@@ -390,7 +413,7 @@ function renderEnterprise() {
   let card = $('ent-card');
   if (!card) { card = document.createElement('div'); card.id = 'ent-card'; list.appendChild(card); }
   const e = enterprise || normEnt(null), st = entState();
-  const total = departments.length, done = departments.filter(d => d.assessed).length;
+  const total = departments.filter(countable).length, done = departments.filter(d => countable(d) && d.assessed).length;
   const hasResult = e.assessed;
   const stale = hasResult && e.departmentsCount != null && done > e.departmentsCount;
   const scorable = e.blocksTotal != null ? e.blocksTotal - (e.blocksNotRelevant || 0) : null;
@@ -412,10 +435,10 @@ function renderEnterprise() {
   const when = t => { if (!t) return ''; const d = new Date(t); return isNaN(d) ? '' : relTime(d.getTime()); };
   const stateText = {
     running: 'assessing…', locked: 'not ready', ready: 'not run yet',
-    complete: 'assessed', partial: 'partial result', failed: 'last run failed', blocked: 'blocked'
+    complete: 'assessed', partial: 'partial result', failed: 'last run failed', blocked: 'blocked', stopped: 'stopped by you'
   }[st];
-  const right = st === 'running' ? esc(ENT_STEPS[entRun.step]) : (st === 'complete' || st === 'partial') ? esc(when(e.completedAt)) : `${done}/${total} departments assessed`;
-  const pct = hasResult && st !== 'running' ? `<div class="dept-pct${st === 'failed' ? ' muted' : ''}">${e.automation == null ? '—' : e.automation}<small>%</small></div>` : '';
+  const right = st === 'running' ? esc(ENT_STEPS[entRun.step]) : (st === 'complete' || st === 'partial') ? esc(when(e.completedAt)) : st === 'stopped' ? esc(when(e.lastRunAt)) : `${done}/${total} departments assessed`;
+  const pct = hasResult && st !== 'running' ? `<div class="dept-pct${st === 'failed' || st === 'stopped' ? ' muted' : ''}">${e.automation == null ? '—' : e.automation}<small>%</small></div>` : '';
 
   let body = '';
   if (hasResult && st !== 'running') {
@@ -424,12 +447,14 @@ function renderEnterprise() {
     if (e.blocksTotal != null) facts.push(`${e.blocksAssessed ?? 0} of ${e.blocksTotal} building blocks scored${e.blocksNotRelevant ? `, ${e.blocksNotRelevant} not relevant` : ''}`);
     if (e.departmentsCount != null) facts.push(`${e.departmentsCount} department${e.departmentsCount === 1 ? '' : 's'} consolidated`);
     if (e.files.length) facts.push(`${e.files.length}${e.filesExpected ? ` of ${e.filesExpected}` : ''} files in Enterprise Assessment`);
-    body += `<ul class="ent-facts${st === 'failed' ? ' muted' : ''}">${facts.map(f => `<li>${f}</li>`).join('')}</ul>`;
+    body += `<ul class="ent-facts${st === 'failed' || st === 'stopped' ? ' muted' : ''}">${facts.map(f => `<li>${f}</li>`).join('')}</ul>`;
   }
   if (st === 'partial' && e.issues.length)
     body += `<div class="ent-alert warn"><b>What's incomplete</b><ul>${e.issues.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>`;
   if (st === 'failed')
     body += `<div class="ent-alert err"><b>The last run didn't finish${e.lastRunAt ? ` (${esc(when(e.lastRunAt))})` : ''}</b><p>${esc(e.lastError || 'Unknown error.')}</p>${hasResult ? `<p>The figures above are from the previous run${e.completedAt ? `, ${esc(when(e.completedAt))}` : ''}.</p>` : ''}</div>`;
+  if (st === 'stopped')
+    body += `<div class="ent-alert neutral"><b>You stopped the last run</b><p>Files it had already written to Drive are kept.${hasResult ? ` The figures above are from the previous run${e.completedAt ? `, ${esc(when(e.completedAt))}` : ''}.` : ''}</p></div>`;
   if (st === 'blocked')
     body += `<div class="ent-alert warn"><b>Assess these departments first</b><p>${esc(e.incompleteDepartments.join(', ') || departments.filter(d => !d.assessed).map(d => d.name).join(', '))}</p></div>`;
   if (st === 'locked')
@@ -438,9 +463,9 @@ function renderEnterprise() {
     body += `<div class="ent-alert warn"><b>Out of date</b><p>${done - e.departmentsCount} department${done - e.departmentsCount === 1 ? ' was' : 's were'} assessed after this run. Run it again to include ${done - e.departmentsCount === 1 ? 'it' : 'them'}.</p></div>`;
 
   const canRun = done === total && total > 0 && !entRun;
-  const label = st === 'ready' ? 'Create enterprise assessment' : st === 'failed' ? 'Try again' : 'Run again';
-  const urgent = st === 'ready' || st === 'failed' || st === 'partial' || stale;
-  const action = canRun && st !== 'locked' ? `<div class="ent-act${urgent ? ' show' : ''}"><button onclick="quickSend('Create Enterprise Assessment')">${label}</button></div>` : '';
+  const label = st === 'ready' ? 'Create enterprise assessment' : (st === 'failed' || st === 'stopped') ? 'Try again' : 'Run again';
+  const urgent = st === 'ready' || st === 'failed' || st === 'partial' || st === 'stopped' || stale;
+  const action = st === 'running' ? `<div class="ent-act show"><button class="stop-btn" onclick="stopRun()">Stop</button></div>` : canRun && st !== 'locked' ? `<div class="ent-act${urgent ? ' show' : ''}"><button onclick="quickSend('Create Enterprise Assessment')">${label}</button></div>` : '';
 
   card.className = `dept ent ent-${st}`;
   card.innerHTML = `<div class="dept-top"><div class="dept-name">Enterprise</div>${pct}</div>${rail}
@@ -449,11 +474,11 @@ function renderEnterprise() {
 
 // A long run can outlive the HTTP request (proxy timeout) while n8n keeps going and saves the result.
 // After an error, poll the saved session for a few minutes and pick the result up if it lands.
-async function recoverAfterError(sid, since, token) {
+async function recoverAfterError(sid, since, token, immediate) {
   if (!LOAD_URL) return;
   const note = addNote('working', '<i></i><span>Checking whether the run finished on the server…</span>');
   for (let k = 0; k < 12; k++) {
-    await new Promise(r => setTimeout(r, 20000));
+    await new Promise(r => setTimeout(r, immediate && k === 0 ? 1500 : 20000));
     if (token !== recoverToken || sid !== sessionId) { note.remove(); return; }
     try {
       const res = await fetch(LOAD_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sid }) });
@@ -492,9 +517,53 @@ function quickSend(text) { $('user-input').value = text; onInputChange($('user-i
 function generateSessionId() { return 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7); }
 function updateSessionLabel() { $('chat-title').textContent = companyName ? `${companyName} — AS-IS discovery` : 'New session'; $('session-label').textContent = `Session ${sessionId.slice(-10)}`; }
 function onInputChange(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 140) + 'px'; syncSend(); }
-function syncSend() { $('send-btn').disabled = (!$('user-input').value.trim() && !attachedFiles.length) || isLoading; }
-function handleKeydown(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!isLoading && ($('user-input').value.trim() || attachedFiles.length)) sendMessage(); } }
+function syncSend() { $('send-btn').disabled = activeRun ? !!activeRun.stopping : ((!$('user-input').value.trim() && !attachedFiles.length) || isLoading); }
+function handleKeydown(e) {
+  if (e.key === 'Escape' && activeRun) { e.preventDefault(); stopRun(); return; } if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!isLoading && ($('user-input').value.trim() || attachedFiles.length)) sendMessage(); } }
 function useChip(el) { $('user-input').value = el.textContent; onInputChange($('user-input')); sendMessage(); }
 function scrollBottom() { const m = $('messages'); m.scrollTop = m.scrollHeight; }
 function esc(t) { return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/\n/g, '<br>'); }
 function escAttr(t) { return String(t).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;'); }
+
+// ── Stop ──
+const SEND_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>';
+const STOP_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2.5"/></svg>';
+function setSendMode(running) {
+  const b = $('send-btn');
+  b.classList.toggle('stop', running);
+  b.innerHTML = running ? STOP_ICON : SEND_ICON;
+  b.setAttribute('aria-label', running ? 'Stop' : 'Send');
+  b.title = running ? 'Stop (Esc)' : 'Send';
+  syncSend();
+}
+function onSendClick() { activeRun ? stopRun() : sendMessage(); }
+
+// Stops waiting in this tab AND asks n8n to cancel the running executions for this session.
+async function stopRun() {
+  const run = activeRun; if (!run || run.stopping) return;
+  run.stopping = true; syncSend();
+  run.controller.abort();
+  const note = addNote('working', '<i></i><span>Stopping the run on the server…</span>');
+  let result = null;
+  if (STOP_URL) {
+    try {
+      const res = await fetch(STOP_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: run.sid, text: run.text, kind: run.kind, since: run.since }) });
+      if (res.ok) result = await res.json();
+    } catch { /* reported below */ }
+  }
+  note.remove();
+  if (run.sid !== sessionId) return;   // user switched sessions meanwhile; the server has the record
+  if (result && result.stopped) {
+    addMessage('agent', result.note || 'Stopped at your request.');
+    if (run.kind === 'enterprise') enterprise = { ...(enterprise || normEnt(null)), status: 'stopped', lastError: 'Stopped by you.', lastRunAt: new Date().toISOString() };
+    $('status-dot').className = 'conn';
+  } else if (result && result.reason === 'finished') {
+    addNote('info', 'The run had already finished — loading its result.');
+    recoverAfterError(run.sid, run.startMs, ++recoverToken, true);
+  } else {
+    addNote('error', "Stopped waiting here, but the server didn't confirm it stopped. It may still finish — checking for a result.");
+    recoverAfterError(run.sid, run.startMs, ++recoverToken, true);
+  }
+  renderBoard(); saveCurrentConversation(); refreshSidebarFromServer();
+}
