@@ -295,11 +295,14 @@ async function sendMessage() {
     removeTyping();
     if (err.name === 'AbortError') { /* the user pressed Stop — stopRun() reports the outcome */ }
     else {
-    $('status-dot').className = 'conn error';
     const longRun = entRunNow || assess || answering;
-    addNote('error', `Couldn't reach the assistant (${esc(err.message)}).${longRun ? ' The run may still be finishing on the server — checking below.' : ' Check that the n8n workflow is active and try again.'}`);
-    if (entRunNow) enterprise = { ...(enterprise || normEnt(null)), status: 'failed', lastError: `No reply from the server (${err.message}).`, lastRunAt: new Date().toISOString() };
-    if (longRun) recoverAfterError(sentSid, sentAt, myToken);
+    if (longRun) {
+      // Long runs outlast the n8n Cloud request limit (~100 s). The run keeps going on the server — expected, not an error.
+      recoverAfterError(sentSid, sentAt, myToken);
+    } else {
+      $('status-dot').className = 'conn error';
+      addNote('error', `Couldn't reach the assistant (${esc(err.message)}). Check that the n8n workflow is active and try again.`);
+    }
     }
   } finally {
     if (stepTimer) clearInterval(stepTimer);
@@ -489,9 +492,11 @@ function renderEnterprise() {
 async function recoverAfterError(sid, since, token, immediate) {
   if (!LOAD_URL) return;
   recovering++; renderBoard();
-  const done = () => { recovering = Math.max(0, recovering - 1); renderBoard(); };
-  const note = addNote('working', '<i></i><span>Checking whether the run finished on the server…</span>');
-  for (let k = 0; k < 12; k++) {
+  const note = addNote('working', '<i></i><span class="step">Still working on the server…</span><span>long runs take several minutes — the reply will appear here when it\'s ready</span>');
+  const startedAt = Date.now();
+  const tick = setInterval(() => { const m = Math.floor((Date.now() - startedAt) / 60000); const s = note.querySelector('.step'); if (s) s.textContent = `Still working on the server… (${m} min)`; }, 30000);
+  const done = () => { clearInterval(tick); recovering = Math.max(0, recovering - 1); renderBoard(); };
+  for (let k = 0; k < 90; k++) {   // 90 × 20 s ≈ 30 minutes
     await new Promise(r => setTimeout(r, immediate && k === 0 ? 1500 : 20000));
     if (token !== recoverToken || sid !== sessionId) { note.remove(); done(); return; }
     try {
@@ -516,7 +521,8 @@ async function recoverAfterError(sid, since, token, immediate) {
     } catch { /* keep trying */ }
   }
   note.remove(); done();
-  addNote('error', 'No result arrived on the server for that run. Send the message again to retry.');
+  $('status-dot').className = 'conn error';
+  addNote('error', 'No result after 30 minutes. The run may have stopped — open the session again from the sidebar to check, or send the message again to retry.');
 }
 
 function countUp(el, target) {
