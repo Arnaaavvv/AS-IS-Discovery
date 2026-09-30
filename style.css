@@ -221,7 +221,8 @@ textarea { font: inherit; }
 .dept.cross.missing { background: var(--paper); }
 .dept.cross.missing .dept-name { color: var(--mute); }
 .cross-note { margin-top: 6px; font-size: 12px; line-height: 1.45; color: var(--mute); }
-.dept-act button:disabled { opacity: .5; cursor: default; }
+.dept-act button:disabled, .ent-act button:disabled { opacity: .55; cursor: not-allowed; }
+.dept-act button:disabled:hover, .ent-act button:disabled:hover { border-color: var(--line); color: var(--ink-2); background: var(--card); }
 
 /* ── Responsive ───────────────────────────────────── */
 @media (max-width: 1100px) {

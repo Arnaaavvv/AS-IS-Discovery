@@ -1,4 +1,4 @@
-// AS-IS Discovery frontend — build v3 (stop button + cross department)
+// AS-IS Discovery frontend — build v4 (run lock, drive delete, evidence pipeline)
 const WEBHOOK_URL = "https://dtsolutions.app.n8n.cloud/webhook/683536ba-dc5c-4796-89e0-b497f8fa92a4";
 // ── Server session endpoints (build these in n8n — see BACKEND-CHANGES.md) ──
 // SESSIONS_URL  : GET  → [{ sessionId, title, updatedAt, departments }]  (list for the sidebar)
@@ -28,11 +28,14 @@ let prevState = {};             // folderName -> state, to animate changes
 let enterprise = null;          // normalised enterprise state from the server (see normEnt)
 let entRun = null;              // { step } while an enterprise run is in flight (UI only)
 let recoverToken = 0;           // cancels a background "did it finish?" check when a new message is sent
+let recovering = 0;             // >0 while checking whether a run finished on the server
+let bgWatch = null;             // { sid, token } while an enterprise run started elsewhere is still going on the server
 let activeRun = null;           // { controller, sid, text, kind, since, startMs, stopping } while a request is in flight
 
 // Cross Department is permanent but optional: while it has no documents it never blocks anything.
 const isCross = d => /^\s*cross[\s_-]*department\s*$/i.test(String((d && d.name) || ''));
 const countable = d => !(isCross(d) && !d.received);
+const busy = () => !!(activeRun || isLoading || recovering || bgWatch || entRun);
 
 const $ = id => document.getElementById(id);
 const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -119,7 +122,7 @@ async function loadConversation(id) {
   if (LOAD_URL) {
     try {
       const res = await fetch(LOAD_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: id }) });
-      if (res.ok) { const d = await res.json(); if (d && (d.transcript || d.departments)) { entry = { sessionId: id, messages: d.transcript || [], received: d.received || [], departments: d.departments || [], enterprise: d.enterprise || null, companyName: d.companyName || d.title || '' }; fromServer = true; } }
+      if (res.ok) { const d = await res.json(); if (d && (d.transcript || d.departments)) { entry = { sessionId: id, messages: d.transcript || [], received: d.received || [], departments: d.departments || [], enterprise: d.enterprise || null, companyName: d.companyName || d.title || '', enterpriseRunning: !!d.enterpriseRunning }; fromServer = true; } }
     } catch { /* fall through to cache */ }
   }
   if (!entry) entry = loadAllChats()[id];
@@ -127,27 +130,31 @@ async function loadConversation(id) {
 
   sessionId = id; currentMessages = entry.messages || []; receivedDepartments = entry.received || [];
   departments = entry.departments || []; companyName = entry.companyName || ''; runningDept = null; prevState = {};
-  recoverToken++; entRun = null; enterprise = resolveEnterprise(entry.enterprise);
+  recoverToken++; entRun = null; bgWatch = null; enterprise = resolveEnterprise(entry.enterprise);
   $('messages').innerHTML = '';
   addNote('info', `Session resumed — ${currentMessages.length} messages${fromServer ? '' : ' (from this browser)'}`);
   currentMessages.forEach(m => renderMessage(m.role, m.text, m.time, m.files));
   departments.forEach(d => prevState[d.folderName] = stateOf(d));
   saveCurrentConversation();   // refresh the local cache from what we just loaded
   updateSessionLabel(); renderBoard(); renderSidebar(); scrollBottom();
+  if (entry.enterpriseRunning) watchBackgroundRun(id);
 }
 function newConversation() {
   saveCurrentConversation();
   sessionId = generateSessionId(); currentMessages = []; receivedDepartments = []; departments = []; companyName = ''; runningDept = null; prevState = {}; isLoading = false;
-  enterprise = null; entRun = null; recoverToken++;
+  enterprise = null; entRun = null; recoverToken++; bgWatch = null;
   attachedFiles = []; renderAttachments();
   $('user-input').value = ''; $('send-btn').disabled = true; $('status-dot').className = 'conn';
   renderEmpty(); updateSessionLabel(); renderBoard(); renderSidebar();
 }
 function confirmDelete(id) {
-  const msg = DELETE_URL ? 'Delete this session everywhere? Files in Drive are not affected.' : 'Delete this session from this browser? The server copy (if any) is kept. Files in Drive are not affected.';
+  const msg = DELETE_URL ? "Delete this session and move its company folder in Google Drive to the trash?\n\nDrive keeps trashed folders for 30 days, so it can be restored. If another session uses the same folder, the folder is kept."
+                         : 'Delete this session from this browser? The server copy (if any) is kept. Files in Drive are not affected.';
   if (!confirm(msg)) return;
   deleteChat(id);
-  if (DELETE_URL) { fetch(DELETE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: id }) }).then(() => { delete serverIndex[id]; renderSidebar(); }).catch(() => { }); }
+  if (DELETE_URL) { fetch(DELETE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: id }) })
+    .then(r => r.ok ? r.json() : null).then(r => { delete serverIndex[id]; renderSidebar(); if (r && r.reason && !r.folderTrashed && !/no Drive folder/.test(r.reason)) alert(r.reason); })
+    .catch(() => alert("The session was removed here, but the server couldn't be reached — its Drive folder was not trashed.")); }
   id === sessionId ? newConversation() : renderSidebar();
 }
 
@@ -283,6 +290,7 @@ async function sendMessage() {
     if (Array.isArray(data.departments)) departments = data.departments;
     if (typeof data.companyName === 'string') companyName = data.companyName;
     enterprise = resolveEnterprise(data.enterprise);
+    if (data.enterpriseRunning) watchBackgroundRun(sessionId);
   } catch (err) {
     removeTyping();
     if (err.name === 'AbortError') { /* the user pressed Stop — stopRun() reports the outcome */ }
@@ -300,7 +308,7 @@ async function sendMessage() {
   }
   renderBoard(); updateSessionLabel(); saveCurrentConversation();
   refreshSidebarFromServer();   // pick up the server's title/updatedAt for this session
-  isLoading = false; syncSend();
+  isLoading = false; syncSend(); renderBoard();
 }
 
 // ── Department board ──
@@ -320,7 +328,8 @@ function renderBoard() {
     const cross = isCross(d);
     const stateText = running ? 'assessing…' : st === 'done' ? 'assessed' : st === 'wait' ? 'waiting for your answers' : st === 'docs' ? `${d.files || 1} file${(d.files || 1) === 1 ? '' : 's'} filed` : cross ? 'optional — no shared documents yet' : 'no documents yet';
     const pct = st === 'done' ? `<div class="dept-pct" data-count="${d.automation ?? 0}">${changed && !REDUCED ? 0 : (d.automation ?? 0)}<small>%</small></div>` : '';
-    const action = running ? `<button class="stop-btn" onclick="stopRun()">Stop</button>` : st === 'docs' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Start ${esc(d.name)} assessment</button>` : st === 'done' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')">Run again</button>` : st === 'none' ? `<button onclick="document.getElementById('file-input').click()">Attach ${cross ? 'cross-department' : esc(d.name)} documents</button>` : '';
+    const dis = busy() ? ' disabled title="Wait for the current request to finish"' : '';
+    const action = running ? `<button class="stop-btn" onclick="stopRun()">Stop</button>` : st === 'docs' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')"${dis}>Start ${esc(d.name)} assessment</button>` : st === 'done' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')"${dis}>Run again</button>` : st === 'none' ? `<button onclick="document.getElementById('file-input').click()">Attach ${cross ? 'cross-department' : esc(d.name)} documents</button>` : '';
     return `<div class="dept${flash}${cross ? ' cross' : ''}${running ? ' is-running' : ''}" data-folder="${escAttr(d.folderName)}">
       <div class="dept-top"><div class="dept-name"><span class="dept-folder">${esc(d.folderName.split(' - ')[0])}</span>${esc(d.name)}</div>${pct}</div>
       <div class="rail">${seg('docs', st !== 'none')}${seg('wait', st === 'wait' || st === 'done', running)}${seg('done', st === 'done')}</div>
@@ -329,7 +338,7 @@ function renderBoard() {
   }).join('') + (departments.some(isCross) ? '' : `<div class="dept cross missing">
       <div class="dept-top"><div class="dept-name">Cross Department</div></div>
       <div class="cross-note">Not set up for this company yet. It holds documents that cover two or more departments; I'll file them there automatically once it exists.</div>
-      <div class="dept-act show"><button onclick="quickSend('Add Cross Department')" ${activeRun ? 'disabled' : ''}>Add Cross Department folder</button></div></div>`);
+      <div class="dept-act show"><button onclick="quickSend('Add Cross Department')" ${busy() ? 'disabled' : ''}>Add Cross Department folder</button></div></div>`);
   // count-up for newly assessed departments
   list.querySelectorAll('.dept-pct').forEach(el => { const target = Number(el.dataset.count); if (Number(el.firstChild.textContent) !== target) countUp(el, target); });
   departments.forEach(d => prevState[d.folderName] = stateOf(d));
@@ -438,7 +447,7 @@ function renderEnterprise() {
     running: 'assessing…', locked: 'not ready', ready: 'not run yet',
     complete: 'assessed', partial: 'partial result', failed: 'last run failed', blocked: 'blocked', stopped: 'stopped by you'
   }[st];
-  const right = st === 'running' ? esc(ENT_STEPS[entRun.step]) : (st === 'complete' || st === 'partial') ? esc(when(e.completedAt)) : st === 'stopped' ? esc(when(e.lastRunAt)) : `${done}/${total} departments assessed`;
+  const right = st === 'running' ? (entRun.background ? 'running on the server' : esc(ENT_STEPS[entRun.step])) : (st === 'complete' || st === 'partial') ? esc(when(e.completedAt)) : st === 'stopped' ? esc(when(e.lastRunAt)) : `${done}/${total} departments assessed`;
   const pct = hasResult && st !== 'running' ? `<div class="dept-pct${st === 'failed' || st === 'stopped' ? ' muted' : ''}">${e.automation == null ? '—' : e.automation}<small>%</small></div>` : '';
 
   let body = '';
@@ -464,9 +473,11 @@ function renderEnterprise() {
     body += `<div class="ent-alert warn"><b>Out of date</b><p>${done - e.departmentsCount} department${done - e.departmentsCount === 1 ? ' was' : 's were'} assessed after this run. Run it again to include ${done - e.departmentsCount === 1 ? 'it' : 'them'}.</p></div>`;
 
   const canRun = done === total && total > 0 && !entRun;
+  const waiting = busy() && !entRun;
   const label = st === 'ready' ? 'Create enterprise assessment' : (st === 'failed' || st === 'stopped') ? 'Try again' : 'Run again';
   const urgent = st === 'ready' || st === 'failed' || st === 'partial' || st === 'stopped' || stale;
-  const action = st === 'running' ? `<div class="ent-act show"><button class="stop-btn" onclick="stopRun()">Stop</button></div>` : canRun && st !== 'locked' ? `<div class="ent-act${urgent ? ' show' : ''}"><button onclick="quickSend('Create Enterprise Assessment')">${label}</button></div>` : '';
+  const action = st === 'running' ? `<div class="ent-act show"><button class="stop-btn" onclick="${entRun && entRun.background ? 'stopBackgroundRun()' : 'stopRun()'}">Stop</button></div>`
+    : canRun && st !== 'locked' ? `<div class="ent-act${urgent || waiting ? ' show' : ''}"><button onclick="quickSend('Create Enterprise Assessment')"${waiting ? ' disabled' : ''}>${waiting ? 'Waiting for the current request…' : label}</button></div>` : '';
 
   card.className = `dept ent ent-${st}`;
   card.innerHTML = `<div class="dept-top"><div class="dept-name">Enterprise</div>${pct}</div>${rail}
@@ -477,18 +488,20 @@ function renderEnterprise() {
 // After an error, poll the saved session for a few minutes and pick the result up if it lands.
 async function recoverAfterError(sid, since, token, immediate) {
   if (!LOAD_URL) return;
+  recovering++; renderBoard();
+  const done = () => { recovering = Math.max(0, recovering - 1); renderBoard(); };
   const note = addNote('working', '<i></i><span>Checking whether the run finished on the server…</span>');
   for (let k = 0; k < 12; k++) {
     await new Promise(r => setTimeout(r, immediate && k === 0 ? 1500 : 20000));
-    if (token !== recoverToken || sid !== sessionId) { note.remove(); return; }
+    if (token !== recoverToken || sid !== sessionId) { note.remove(); done(); return; }
     try {
       const res = await fetch(LOAD_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sid }) });
       if (!res.ok) continue;
       const d = await res.json(), tr = Array.isArray(d.transcript) ? d.transcript : [];
       const last = tr[tr.length - 1];
       if (!last || last.role !== 'agent' || new Date(last.time).getTime() < since - 5000) continue;
-      if (token !== recoverToken || sid !== sessionId) { note.remove(); return; }
-      note.remove();
+      if (token !== recoverToken || sid !== sessionId) { note.remove(); done(); return; }
+      note.remove(); done();
       addNote('info', 'The run finished on the server — here is its reply.');
       const es = $('empty-state'); if (es) es.remove();
       renderMessage('agent', last.text, last.time, last.files);
@@ -502,7 +515,7 @@ async function recoverAfterError(sid, since, token, immediate) {
       return;
     } catch { /* keep trying */ }
   }
-  note.remove();
+  note.remove(); done();
   addNote('error', 'No result arrived on the server for that run. Send the message again to retry.');
 }
 
@@ -512,7 +525,7 @@ function countUp(el, target) {
   requestAnimationFrame(tick);
 }
 function toggleBoard() { $('board').classList.toggle('open'); }
-function quickSend(text) { $('user-input').value = text; onInputChange($('user-input')); sendMessage(); }
+function quickSend(text) { if (busy()) return; $('user-input').value = text; onInputChange($('user-input')); sendMessage(); }
 
 // ── Small helpers ──
 function generateSessionId() { return 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7); }
@@ -567,4 +580,43 @@ async function stopRun() {
     recoverAfterError(run.sid, run.startMs, ++recoverToken, true);
   }
   renderBoard(); saveCurrentConversation(); refreshSidebarFromServer();
+}
+
+// ── An enterprise run that is still going on the server (started in another tab, before a reload, or blocked by the lock) ──
+function watchBackgroundRun(sid) {
+  if (bgWatch && bgWatch.sid === sid) return;
+  const token = ++recoverToken; bgWatch = { sid, token };
+  entRun = { step: 0, background: true }; renderBoard();
+  const note = addNote('working', '<i></i><span>An enterprise assessment is running on the server — this card updates when it finishes.</span>');
+  (async () => {
+    for (let k = 0; k < 60; k++) {                       // up to ~20 minutes
+      await new Promise(r => setTimeout(r, 20000));
+      if (!bgWatch || bgWatch.token !== token || sid !== sessionId) { note.remove(); return; }
+      try {
+        const res = await fetch(LOAD_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sid }) });
+        if (!res.ok) continue;
+        const d = await res.json(); if (d.enterpriseRunning) continue;
+        if (!bgWatch || bgWatch.token !== token || sid !== sessionId) { note.remove(); return; }
+        note.remove(); bgWatch = null; entRun = null;
+        const tr = Array.isArray(d.transcript) ? d.transcript : [], seen = new Set(currentMessages.map(m => m.role + '|' + m.text));
+        tr.filter(m => !seen.has(m.role + '|' + m.text)).forEach(m => { renderMessage(m.role, m.text, m.time, m.files); currentMessages.push({ role: m.role, text: m.text, time: m.time, files: m.files || [] }); });
+        if (Array.isArray(d.departments)) departments = d.departments;
+        enterprise = resolveEnterprise(d.enterprise);
+        renderBoard(); saveCurrentConversation(); scrollBottom(); return;
+      } catch { /* keep watching */ }
+    }
+    note.remove(); if (bgWatch && bgWatch.token === token) { bgWatch = null; entRun = null; renderBoard(); }
+  })();
+}
+async function stopBackgroundRun() {
+  if (!bgWatch) return;
+  const sid = bgWatch.sid; bgWatch = null; recoverToken++;
+  const note = addNote('working', '<i></i><span>Stopping the run on the server…</span>');
+  let result = null;
+  try { const res = await fetch(STOP_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sid, text: '', kind: 'enterprise', since: new Date().toISOString() }) });
+        if (res.ok) result = await res.json(); } catch { }
+  note.remove(); entRun = null;
+  if (result && result.stopped) { addMessage('agent', result.note || 'Stopped at your request.'); enterprise = { ...(enterprise || normEnt(null)), status: 'stopped', lastError: 'Stopped by you.', lastRunAt: new Date().toISOString() }; }
+  else addNote('info', 'The run had already finished or could not be stopped — reload the session to see its result.');
+  renderBoard(); saveCurrentConversation();
 }
