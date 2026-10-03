@@ -330,7 +330,7 @@ function renderBoard() {
     const seg = (cls, on, run) => `<div class="seg ${cls}${on ? ' on' : ''}${run ? ' running' : ''}"><i></i></div>`;
     const cross = isCross(d);
     const stateText = running ? 'assessing…' : st === 'done' ? 'assessed' : st === 'wait' ? 'waiting for your answers' : st === 'docs' ? `${d.files || 1} file${(d.files || 1) === 1 ? '' : 's'} filed` : cross ? 'optional — no shared documents yet' : 'no documents yet';
-    const pct = st === 'done' ? `<div class="dept-pct" data-count="${d.automation ?? 0}">${changed && !REDUCED ? 0 : (d.automation ?? 0)}<small>%</small></div>` : '';
+    const pct = st === 'done' ? `<div class="dept-pct" data-count="${d.automation ?? 0}" title="Calibrated automation level (0 / 10 / 30 / 50 / 70 / 100)">${changed && !REDUCED ? 0 : (d.automation ?? 0)}<small>level</small></div>` : '';
     const dis = busy() ? ' disabled title="Wait for the current request to finish"' : '';
     const action = running ? `<button class="stop-btn" onclick="stopRun()">Stop</button>` : st === 'docs' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')"${dis}>Start ${esc(d.name)} assessment</button>` : st === 'done' ? `<button onclick="quickSend('Start ${escAttr(d.name)}')"${dis}>Run again</button>` : st === 'none' ? `<button onclick="document.getElementById('file-input').click()">Attach ${cross ? 'cross-department' : esc(d.name)} documents</button>` : '';
     return `<div class="dept${flash}${cross ? ' cross' : ''}${running ? ' is-running' : ''}" data-folder="${escAttr(d.folderName)}">
@@ -347,9 +347,11 @@ function renderBoard() {
   departments.forEach(d => prevState[d.folderName] = stateOf(d));
   const counted = departments.filter(countable);
   const assessed = counted.filter(d => d.assessed), docs = counted.filter(d => d.received).length;
-  const avg = assessed.length ? Math.round(assessed.reduce((a, d) => a + (Number(d.automation) || 0), 0) / assessed.length) : null;
+  // Cross Department is a cross-functional domain, not a department: it is never part of the department average.
+  const orgAssessed = assessed.filter(d => !isCross(d));
+  const avg = orgAssessed.length ? Math.round(orgAssessed.reduce((a, d) => a + (Number(d.automation) || 0), 0) / orgAssessed.length * 10) / 10 : null;
   renderEnterprise();
-  foot.innerHTML = `<b>${assessed.length} of ${counted.length}</b> assessed · ${docs} with documents${avg !== null ? ` · average automation <b>${avg}%</b>` : ''}`;
+  foot.innerHTML = `<b>${assessed.length} of ${counted.length}</b> assessed · ${docs} with documents${avg !== null ? ` · raw average of department levels <b>${avg}</b>` : ''}`;
   $('board-count').textContent = `${assessed.length}/${counted.length} assessed`;
 }
 // ── Enterprise card ──
@@ -362,7 +364,10 @@ function normEnt(e) {
   const n = v => (v == null || v === '' || !isFinite(Number(v))) ? null : Number(v);
   const arr = v => Array.isArray(v) ? v : [];
   return {
-    assessed: !!e.assessed, status: e.status || (e.assessed ? 'complete' : 'not_run'),
+    assessed: !!e.assessed, status: e.status === 'validation_failed' ? 'failed' : (e.status || (e.assessed ? 'complete' : 'not_run')),
+    validationFailed: e.status === 'validation_failed' || !!e.validationFailed, failedStage: e.failedStage || '',
+    overallStatus: e.overallStatus || '', componentStatus: (e.componentStatus && typeof e.componentStatus === 'object') ? e.componentStatus : null,
+    automationRawAverage: n(e.automationRawAverage), crossDomainsCount: n(e.crossDomainsCount), blocksInsufficientEvidence: n(e.blocksInsufficientEvidence),
     automation: n(e.automation), maturityLevel: e.maturityLevel || '', maturityScore: n(e.maturityScore),
     blocksAssessed: n(e.blocksAssessed), blocksTotal: n(e.blocksTotal), blocksNotRelevant: n(e.blocksNotRelevant),
     departmentsCount: n(e.departmentsCount), files: arr(e.files), filesExpected: n(e.filesExpected),
@@ -382,6 +387,20 @@ function enterpriseFromTranscript(msgs) {
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]; if (!m || m.role !== 'agent') continue;
     const t = String(m.text || ''), when = isoOf(m.time);
+    if (/^\s*Enterprise Digital Maturity Assessment (complete|finished)/i.test(t) && /Enterprise calibrated automation level:/i.test(t)) {
+      // Current message format (raw average and calibrated level are separate lines).
+      const num = re => { const x = t.match(re); return x ? Number(x[1]) : null; };
+      const list = head => { const p = t.split(head)[1]; if (!p) return []; return p.split('\n').slice(1).map(l => l.trim()).filter((l, k, a) => l && a.slice(0, k + 1).every(x => /^[•\-*]/.test(x))).map(l => l.replace(/^[•\-*]\s*/, '')); };
+      const overall = (t.match(/Overall Assessment Status:\s*([A-Z_]+)/i) || [])[1] || '';
+      const mat = t.match(/Average maturity of (\d+) sufficiently evidenced building blocks = ([\d.]+) \/ 5\. \d+ of (\d+)/i);
+      const ok = normEnt({ assessed: true, status: overall === 'INCOMPLETE' ? 'partial' : 'complete', overallStatus: overall,
+        automation: num(/Enterprise calibrated automation level:\s*([\d.]+)/i), automationRawAverage: num(/Enterprise raw average:\s*([\d.]+)/i),
+        maturityScore: mat ? Number(mat[2]) : null, blocksAssessed: mat ? Number(mat[1]) : null, blocksTotal: mat ? Number(mat[3]) : null,
+        blocksInsufficientEvidence: num(/(\d+) building block\(s\) remain insufficiently evidenced/i),
+        departmentsCount: num(/Consolidated (\d+) organizational department/i), crossDomainsCount: num(/\+ (\d+) cross-functional process domain/i),
+        files: list(/Files saved[^\n]*/i), issues: list(/Issues \/ limitations:/i), completedAt: when });
+      return latest ? { ...ok, status: latest.status, lastError: latest.lastError, validationFailed: latest.validationFailed, failedStage: latest.failedStage, incompleteDepartments: latest.incompleteDepartments, lastRunAt: latest.lastRunAt } : ok;
+    }
     if (/^\s*Enterprise Digital Maturity Assessment (complete|finished with gaps)/i.test(t)) {
       const num = re => { const x = t.match(re); return x ? Number(x[1]) : null; };
       const mat = t.match(/Digital maturity:\s*(.*?)\s*\(([\d.]+|N\/A) of 5\),\s*(\d+) of (\d+) building blocks/i);
@@ -398,7 +417,9 @@ function enterpriseFromTranscript(msgs) {
       return latest ? { ...ok, status: latest.status, lastError: latest.lastError, incompleteDepartments: latest.incompleteDepartments, lastRunAt: latest.lastRunAt } : ok;
     }
     if (latest) continue;   // already found the latest attempt; keep looking only for the last good result
-    if (/^\s*Stopped the enterprise assessment/i.test(t))
+    if (/^\s*Enterprise assessment stopped — /i.test(t))
+      latest = normEnt({ status: 'validation_failed', failedStage: (t.match(/stopped — (.*?) did not pass/i) || [])[1] || '', lastError: t.split('\n').filter(l => /^\s*•/.test(l)).map(l => l.replace(/^\s*•\s*/, '')).join(' ') || 'Validation did not pass.', lastRunAt: when });
+    else if (/^\s*Stopped the enterprise assessment/i.test(t))
       latest = normEnt({ status: 'stopped', lastError: 'Stopped by you.', lastRunAt: when });
     else if (/^\s*The enterprise assessment could not be completed:?\s*/i.test(t))
       latest = normEnt({ status: 'failed', lastError: t.replace(/^\s*The enterprise assessment could not be completed:?\s*/i, '').split('\n')[0], lastRunAt: when });
@@ -428,8 +449,10 @@ function renderEnterprise() {
   const e = enterprise || normEnt(null), st = entState();
   const total = departments.filter(countable).length, done = departments.filter(d => countable(d) && d.assessed).length;
   const hasResult = e.assessed;
-  const stale = hasResult && e.departmentsCount != null && done > e.departmentsCount;
+  const consolidated = e.departmentsCount != null ? e.departmentsCount + (e.crossDomainsCount || 0) : null;   // org departments + cross-functional domains
+  const stale = hasResult && consolidated != null && done > consolidated;
   const scorable = e.blocksTotal != null ? e.blocksTotal - (e.blocksNotRelevant || 0) : null;
+  const limited = hasResult && e.overallStatus === 'COMPLETE_WITH_LIMITATIONS';
   const blockFrac = hasResult && scorable ? Math.min(1, (e.blocksAssessed || 0) / scorable) : hasResult ? 1 : 0;
 
   // Three stages: departments ready → consolidation (AS-IS, automation, requirements) → 77-block maturity.
@@ -448,24 +471,31 @@ function renderEnterprise() {
   const when = t => { if (!t) return ''; const d = new Date(t); return isNaN(d) ? '' : relTime(d.getTime()); };
   const stateText = {
     running: 'assessing…', locked: 'not ready', ready: 'not run yet',
-    complete: 'assessed', partial: 'partial result', failed: 'last run failed', blocked: 'blocked', stopped: 'stopped by you'
+    complete: limited ? 'assessed · with limitations' : 'assessed', partial: 'incomplete result', failed: 'last run failed', blocked: 'blocked', stopped: 'stopped by you'
   }[st];
   const right = st === 'running' ? (entRun.background ? 'running on the server' : esc(ENT_STEPS[entRun.step])) : (st === 'complete' || st === 'partial') ? esc(when(e.completedAt)) : st === 'stopped' ? esc(when(e.lastRunAt)) : `${done}/${total} departments assessed`;
-  const pct = hasResult && st !== 'running' ? `<div class="dept-pct${st === 'failed' || st === 'stopped' ? ' muted' : ''}">${e.automation == null ? '—' : e.automation}<small>%</small></div>` : '';
+  const pct = hasResult && st !== 'running' ? `<div class="dept-pct${st === 'failed' || st === 'stopped' ? ' muted' : ''}" title="Enterprise calibrated automation level (0 / 10 / 30 / 50 / 70 / 100)">${e.automation == null ? '—' : e.automation}<small>level</small></div>` : '';
 
   let body = '';
   if (hasResult && st !== 'running') {
     const facts = [];
-    if (e.maturityLevel || e.maturityScore != null) facts.push(`Maturity <b>${esc(e.maturityLevel || 'N/A')}</b>${e.maturityScore != null ? ` (${e.maturityScore} of 5)` : ''}`);
-    if (e.blocksTotal != null) facts.push(`${e.blocksAssessed ?? 0} of ${e.blocksTotal} building blocks scored${e.blocksNotRelevant ? `, ${e.blocksNotRelevant} not relevant` : ''}`);
-    if (e.departmentsCount != null) facts.push(`${e.departmentsCount} department${e.departmentsCount === 1 ? '' : 's'} consolidated`);
+    if (e.overallStatus) facts.push(`Status <b>${esc(e.overallStatus.replace(/_/g, ' ').toLowerCase())}</b>`);
+    if (e.automation != null) facts.push(`Automation level <b>${e.automation}</b>${e.automationRawAverage != null ? ` (raw average ${e.automationRawAverage})` : ''}`);
+    if (e.maturityScore != null && e.blocksAssessed != null) facts.push(`Average maturity <b>${e.maturityScore} / 5</b> across ${e.blocksAssessed} sufficiently evidenced building blocks${e.maturityLevel ? ` (${esc(e.maturityLevel)})` : ''}`);
+    else if (e.maturityLevel || e.maturityScore != null) facts.push(`Maturity <b>${esc(e.maturityLevel || 'N/A')}</b>${e.maturityScore != null ? ` (${e.maturityScore} of 5)` : ''}`);
+    if (e.blocksTotal != null) facts.push(`${e.blocksAssessed ?? 0} of ${e.blocksTotal} building blocks assessed${e.blocksInsufficientEvidence ? `, ${e.blocksInsufficientEvidence} insufficient evidence (not scored)` : ''}${e.blocksNotRelevant ? `, ${e.blocksNotRelevant} not relevant` : ''}`);
+    if (e.departmentsCount != null) facts.push(`${e.departmentsCount} department${e.departmentsCount === 1 ? '' : 's'}${e.crossDomainsCount ? ` + ${e.crossDomainsCount} cross-functional domain${e.crossDomainsCount === 1 ? '' : 's'} (not weighted)` : ''} consolidated`);
     if (e.files.length) facts.push(`${e.files.length}${e.filesExpected ? ` of ${e.filesExpected}` : ''} files in Enterprise Assessment`);
     body += `<ul class="ent-facts${st === 'failed' || st === 'stopped' ? ' muted' : ''}">${facts.map(f => `<li>${f}</li>`).join('')}</ul>`;
   }
+  if (st === 'complete' && limited && e.issues.length)
+    body += `<div class="ent-alert neutral"><b>Limitations</b><ul>${e.issues.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>`;
   if (st === 'partial' && e.issues.length)
     body += `<div class="ent-alert warn"><b>What's incomplete</b><ul>${e.issues.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>`;
   if (st === 'failed')
-    body += `<div class="ent-alert err"><b>The last run didn't finish${e.lastRunAt ? ` (${esc(when(e.lastRunAt))})` : ''}</b><p>${esc(e.lastError || 'Unknown error.')}</p>${hasResult ? `<p>The figures above are from the previous run${e.completedAt ? `, ${esc(when(e.completedAt))}` : ''}.</p>` : ''}</div>`;
+    body += e.validationFailed
+      ? `<div class="ent-alert err"><b>The last run stopped at validation${e.failedStage ? ` (${esc(e.failedStage)})` : ''}${e.lastRunAt ? ` · ${esc(when(e.lastRunAt))}` : ''}</b><p>No enterprise files were generated. Details are in Enterprise Validation Report.json in 00 - Assessment Control.</p>${e.issues.length ? `<ul>${e.issues.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : `<p>${esc(e.lastError || '')}</p>`}${hasResult ? `<p>The figures above are from the previous run${e.completedAt ? `, ${esc(when(e.completedAt))}` : ''}.</p>` : ''}</div>`
+      : `<div class="ent-alert err"><b>The last run didn't finish${e.lastRunAt ? ` (${esc(when(e.lastRunAt))})` : ''}</b><p>${esc(e.lastError || 'Unknown error.')}</p>${hasResult ? `<p>The figures above are from the previous run${e.completedAt ? `, ${esc(when(e.completedAt))}` : ''}.</p>` : ''}</div>`;
   if (st === 'stopped')
     body += `<div class="ent-alert neutral"><b>You stopped the last run</b><p>Files it had already written to Drive are kept.${hasResult ? ` The figures above are from the previous run${e.completedAt ? `, ${esc(when(e.completedAt))}` : ''}.` : ''}</p></div>`;
   if (st === 'blocked')
@@ -473,7 +503,7 @@ function renderEnterprise() {
   if (st === 'locked')
     body += `<p class="ent-hint">Runs once every department is assessed — ${total - done} to go.</p>`;
   if (stale && st !== 'running')
-    body += `<div class="ent-alert warn"><b>Out of date</b><p>${done - e.departmentsCount} department${done - e.departmentsCount === 1 ? ' was' : 's were'} assessed after this run. Run it again to include ${done - e.departmentsCount === 1 ? 'it' : 'them'}.</p></div>`;
+    body += `<div class="ent-alert warn"><b>Out of date</b><p>${done - consolidated} department${done - consolidated === 1 ? ' was' : 's were'} assessed after this run. Run it again to include ${done - consolidated === 1 ? 'it' : 'them'}.</p></div>`;
 
   const canRun = done === total && total > 0 && !entRun;
   const waiting = busy() && !entRun;
